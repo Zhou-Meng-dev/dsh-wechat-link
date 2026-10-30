@@ -1,0 +1,54 @@
+{
+  "name": "dsh-wechat-link",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "把微信（iLink）接入 DeepSeek Harness 的多租户桥接；支持定时任务、图片/文件与 Docker",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "sim": "node src/cli-sim.mjs",
+    "start": "node src/main.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.mjs",
+    "lint": "node scripts/syntax-check.mjs",
+    "check": "npm run lint && npm test",
+    "build:sea": "node scripts/build-sea.mjs",
+    "prepublishOnly": "npm run check"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
+  },
+  "bin": {
+    "dsh-wechat-link": "bin/dsh-wechat-link.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "examples/",
+    "assets/",
+    "README.md",
+    "scripts/"
+  ],
+  "keywords": [
+    "wechat",
+    "weixin",
+    "ilink",
+    "dsh",
+    "deepseek-harness",
+    "bridge",
+    "bot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zhou-Meng-dev/dsh-wechat-link.git"
+  },
+  "homepage": "https://github.com/Zhou-Meng-dev/dsh-wechat-link#readme",
+  "bugs": {
+    "url": "https://github.com/Zhou-Meng-dev/dsh-wechat-link/issues"
+  },
+  "license": "MIT",
+  "author": "ZhouMeng"
+}

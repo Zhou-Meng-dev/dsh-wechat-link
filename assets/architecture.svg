@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="1600" viewBox="0 0 1760 1600" font-family="'Droid Sans Fallback','Noto Sans CJK SC','Source Han Sans SC','Microsoft YaHei','PingFang SC',sans-serif" role="img" aria-labelledby="ttl dsc">
+<title id="ttl">dsh-wechat-link 架构与会话/定时任务数据流</title>
+<desc id="dsc">微信 ⇄ iLink ⇄ 桥接（宿主）⇄ bwrap 沙箱 ⇄ dsh agent。蓝线为会话消息，橙线为定时任务，灰色为状态与配置读写。</desc>
+<defs>
+<marker id="m-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+<marker id="m-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ea580c"/></marker>
+<marker id="m-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+<marker id="m-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#16a34a"/></marker>
+</defs>
+<rect x="0" y="0" width="1760" height="1600" fill="#f8fafc"/>
+<text x="40" y="50" font-size="27" font-weight="700" fill="#0f172a" text-anchor="start">dsh-wechat-link · 微信 ⇄ DSH 桥接架构</text>
+<text x="40" y="78" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">多租户 · 每租户一个 dsh 沙箱 · 蓝线 = 会话消息，橙线 = 定时任务，灰线 = 状态/配置落盘</text>
+<line x1="1140" y1="52" x2="1174" y2="52" stroke="#2563eb" stroke-width="2.4"/>
+<text x="1182" y="57" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">会话消息</text>
+<line x1="1290" y1="52" x2="1324" y2="52" stroke="#ea580c" stroke-width="2.4"/>
+<text x="1332" y="57" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">定时任务</text>
+<line x1="1440" y1="52" x2="1474" y2="52" stroke="#64748b" stroke-width="2.4"/>
+<text x="1482" y="57" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">状态/配置</text>
+<line x1="1590" y1="52" x2="1624" y2="52" stroke="#16a34a" stroke-width="2.4"/>
+<text x="1632" y="57" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">沙箱边界</text>
+<text x="40" y="102" font-size="18" font-weight="700" fill="#64748b" text-anchor="start">1 · 组件与边界</text>
+<rect x="40" y="180" width="230" height="90" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="56" y="206" font-size="16" font-weight="700" fill="#0f172a" text-anchor="start">微信用户</text>
+<text x="56" y="230" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">owner / allowUsers 白名单</text>
+<text x="56" y="252" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">唯一能驱动 bot 的人</text>
+<rect x="40" y="350" width="230" height="120" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="56" y="378" font-size="15" font-weight="700" fill="#0f172a" text-anchor="start">腾讯 iLink Bot 通道</text>
+<text x="56" y="404" font-size="12" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">getUpdates（长轮询）</text>
+<text x="56" y="426" font-size="12" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">sendText（下行）</text>
+<text x="56" y="450" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">官方 bot 接口，非个人微信</text>
+<line x1="140" y1="272" x2="140" y2="346" stroke="#64748b" stroke-width="2" marker-end="url(#m-gray)"/>
+<line x1="170" y1="346" x2="170" y2="272" stroke="#64748b" stroke-width="2" marker-end="url(#m-gray)"/>
+<text x="182" y="306" font-size="10" font-weight="400" fill="#64748b" text-anchor="start">上行</text>
+<text x="182" y="338" font-size="10" font-weight="400" fill="#64748b" text-anchor="start">下行</text>
+<rect x="320" y="115" width="700" height="645" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 5"/>
+<text x="340" y="142" font-size="15" font-weight="700" fill="#0f172a" text-anchor="start">桥接进程（宿主机 · Node.js ≥22 · 零第三方依赖）</text>
+<rect x="340" y="170" width="660" height="58" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="356" y="196" font-size="14" font-weight="700" fill="#0f172a" text-anchor="start">main.mjs + cli/</text>
+<text x="356" y="220" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">login / list / rm / persona / apikey / task —— 直接读写磁盘配置</text>
+<rect x="340" y="240" width="660" height="46" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="356" y="269" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">TenantRegistry：每租户一个 Tenant；配置 3 秒热加载，变更只重启对应租户</text>
+<rect x="340" y="300" width="660" height="405" rx="10" fill="#fdfdff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="360" y="328" font-size="14" font-weight="700" fill="#1e3a8a" text-anchor="start">Tenant t-xxx（每租户一套：token / dsh 进程 / 目录 / 会话）</text>
+<rect x="360" y="345" width="290" height="82" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="376" y="371" font-size="13" font-weight="700" fill="#0f172a" text-anchor="start">IlinkClient</text>
+<text x="376" y="395" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">长轮询 getUpdates</text>
+<text x="376" y="413" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">sendText / typing</text>
+<rect x="690" y="345" width="290" height="82" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="706" y="371" font-size="13" font-weight="700" fill="#0f172a" text-anchor="start">ConversationManager</text>
+<text x="706" y="395" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">peer→session 映射</text>
+<text x="706" y="413" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">回合串行队列</text>
+<rect x="360" y="447" width="290" height="120" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="376" y="473" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">TaskScheduler</text>
+<text x="376" y="497" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">fs.watch(_tasks/pending · tasks.json)</text>
+<text x="376" y="515" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">准点 timer + 60s 兜底</text>
+<text x="376" y="533" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">校验 → tasks.json → 回执</text>
+<rect x="690" y="447" width="290" height="82" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="706" y="473" font-size="13" font-weight="700" fill="#0f172a" text-anchor="start">SessionStore</text>
+<text x="706" y="497" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">bridge-state.json</text>
+<text x="706" y="515" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">每 5s / 停止时刷盘</text>
+<rect x="360" y="585" width="620" height="100" rx="10" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="376" y="610" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="start">context_token 缓存（内存 + bridge-state.json）</text>
+<text x="376" y="633" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">来源：用户上行消息；每条下行都必须带它</text>
+<text x="376" y="653" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">定时任务主动推送依赖它；/new 不清除</text>
+<text x="376" y="673" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">agent 看不到这个文件（沙箱外）</text>
+<text x="340" y="735" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">其它租户 = 另一套 Tenant + dsh + 目录，互不影响</text>
+<rect x="1080" y="115" width="640" height="645" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.8" stroke-dasharray="7 5"/>
+<text x="1100" y="142" font-size="15" font-weight="700" fill="#14532d" text-anchor="start">bwrap 沙箱（每个租户一个）</text>
+<rect x="1100" y="165" width="600" height="84" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="1116" y="191" font-size="14" font-weight="700" fill="#0f172a" text-anchor="start">dsh --profile sdk</text>
+<text x="1116" y="215" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">agent 进程（stdio JSON-RPC）</text>
+<text x="1116" y="233" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">会话 / 模型 / 工具都在这里</text>
+<rect x="1100" y="265" width="600" height="56" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="1116" y="298" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">工具：read / write / edit / bash · skills · plugins</text>
+<rect x="1100" y="340" width="600" height="290" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="1116" y="368" font-size="13" font-weight="700" fill="#0f172a" text-anchor="start">沙箱内看到的路径（bind / ro-bind）</text>
+<text x="1132" y="400" font-size="11" font-weight="400" fill="#2563eb" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">~/.dsh</text>
+<text x="1348" y="400" font-size="10.5" font-weight="400" fill="#64748b" text-anchor="start">← bind  &lt;tenant&gt;/dsh-home（rw）</text>
+<text x="1132" y="430" font-size="11" font-weight="400" fill="#2563eb" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">&lt;tenant&gt;/workspace</text>
+<text x="1348" y="430" font-size="10.5" font-weight="400" fill="#64748b" text-anchor="start">← bind  同路径（rw）</text>
+<text x="1132" y="460" font-size="11" font-weight="400" fill="#2563eb" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">/opt/tenant/persona.patch.yml</text>
+<text x="1348" y="460" font-size="10.5" font-weight="400" fill="#64748b" text-anchor="start">← ro-bind  &lt;tenant&gt;/persona.patch.yml</text>
+<text x="1132" y="490" font-size="11" font-weight="400" fill="#2563eb" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">/home/zhoumeng</text>
+<text x="1348" y="490" font-size="10.5" font-weight="400" fill="#64748b" text-anchor="start">tmpfs（宿主 home 不可见）</text>
+<text x="1116" y="540" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">每个租户一个 DSH_HOME：会话、技能、插件、凭据</text>
+<text x="1116" y="562" font-size="11" font-weight="400" fill="#64748b" text-anchor="start">agent 的 cwd = &lt;tenant&gt;/workspace</text>
+<rect x="1100" y="650" width="600" height="90" rx="10" fill="#fef2f2" stroke="#fecaca" stroke-width="1.5"/>
+<text x="1116" y="677" font-size="13" font-weight="700" fill="#991b1b" text-anchor="start">沙箱内看不到</text>
+<text x="1116" y="700" font-size="11.5" font-weight="400" fill="#7f1d1d" text-anchor="start">config.json / secrets.json / bridge-state.json / tasks.json</text>
+<text x="1116" y="722" font-size="11.5" font-weight="400" fill="#7f1d1d" text-anchor="start">其它租户 / 宿主 ~/.ssh、~/code、~/.dsh 原有会话</text>
+<line x1="358" y1="390" x2="272" y2="390" stroke="#64748b" stroke-width="1.8" marker-end="url(#m-gray)"/>
+<line x1="272" y1="412" x2="358" y2="412" stroke="#64748b" stroke-width="1.8" marker-end="url(#m-gray)"/>
+<text x="282" y="382" font-size="9.5" font-weight="400" fill="#64748b" text-anchor="start">getUpdates</text>
+<text x="282" y="430" font-size="9.5" font-weight="400" fill="#64748b" text-anchor="start">消息</text>
+<line x1="982" y1="380" x2="1096" y2="380" stroke="#2563eb" stroke-width="2" marker-end="url(#m-blue)"/>
+<line x1="1096" y1="404" x2="982" y2="404" stroke="#2563eb" stroke-width="2" marker-end="url(#m-blue)"/>
+<text x="996" y="372" font-size="9.5" font-weight="400" fill="#2563eb" text-anchor="start">session/prompt</text>
+<text x="996" y="422" font-size="9.5" font-weight="400" fill="#2563eb" text-anchor="start">session/event</text>
+<line x1="652" y1="507" x2="686" y2="507" stroke="#ea580c" stroke-width="2" marker-end="url(#m-orange)"/>
+<text x="40" y="800" font-size="18" font-weight="700" fill="#64748b" text-anchor="start">2 · 数据落盘位置</text>
+<rect x="40" y="820" width="390" height="150" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="56" y="846" font-size="14" font-weight="700" fill="#0f172a" text-anchor="start">① 配置与凭据（XDG，0600）</text>
+<text x="56" y="870" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">~/.dsh-wechat-link/</text>
+<text x="56" y="890" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">  config.json   可读配置（ownerId）</text>
+<text x="56" y="910" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">  secrets.json  bot token / apiKey</text>
+<text x="56" y="930" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">由 CLI 写；agent 不可见</text>
+<rect x="450" y="820" width="400" height="150" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="466" y="846" font-size="14" font-weight="700" fill="#0f172a" text-anchor="start">② 租户根 ~/.dsh-wechat-link/tenants/t-xxx/</text>
+<text x="466" y="870" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">bridge-state.json  peer→session + token</text>
+<text x="466" y="890" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">tasks.json         定时任务（事实源）</text>
+<text x="466" y="910" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">persona.md         人设原文</text>
+<text x="466" y="930" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">persona.patch.yml  启动时生成</text>
+<rect x="870" y="820" width="380" height="150" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="886" y="846" font-size="14" font-weight="700" fill="#0f172a" text-anchor="start">③ dsh-home/（挂载为 ~/.dsh）</text>
+<text x="886" y="870" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">sessions/          DSH 会话日志</text>
+<text x="886" y="890" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">skills/            每租户技能</text>
+<text x="886" y="910" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">profiles/sdk/      插件</text>
+<text x="886" y="930" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">.credentials.yaml（无独立 key 时）</text>
+<rect x="1270" y="820" width="450" height="150" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="1286" y="846" font-size="14" font-weight="700" fill="#0f172a" text-anchor="start">④ workspace/（agent 唯一可写区）</text>
+<text x="1286" y="870" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">_tasks/pending/       agent 提交的请求</text>
+<text x="1286" y="890" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">_tasks/current.json   任务快照</text>
+<text x="1286" y="910" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">_inbox/ _quiz/        收文件 / 业务数据</text>
+<text x="1286" y="930" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">_tools/               doc_probe.py（自动生成）</text>
+<line x1="520" y1="705" x2="520" y2="817" stroke="#64748b" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#m-gray)"/>
+<text x="532" y="762" font-size="10.5" font-weight="400" fill="#64748b" text-anchor="start" font-family="'DejaVu Sans Mono','Consolas','Menlo','monospace" xml:space="preserve">bridge-state / tasks / persona</text>
+<text x="40" y="1000" font-size="18" font-weight="700" fill="#64748b" text-anchor="start">3 · 两条数据流</text>
+<text x="40" y="1032" font-size="16" font-weight="700" fill="#1e3a8a" text-anchor="start">会话消息流（蓝）</text>
+<rect x="40" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="52" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">① 用户发微信</text>
+<text x="52" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">上行消息</text>
+<text x="52" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">文本 / 图片 / 文件</text>
+<line x1="202" y1="1098" x2="228" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="230" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="242" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">② iLink 收到</text>
+<text x="242" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">长轮询 getUpdates</text>
+<text x="242" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">返回 msgs[]</text>
+<line x1="392" y1="1098" x2="418" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="420" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="432" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">③ Tenant 鉴权</text>
+<text x="432" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">owner / 白名单</text>
+<text x="432" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">同用户串行</text>
+<line x1="582" y1="1098" x2="608" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="610" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="622" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">④ conv.ask(peer)</text>
+<text x="622" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">取 peer 的 session</text>
+<text x="622" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">进串行队列</text>
+<line x1="772" y1="1098" x2="798" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="800" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="812" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">⑤ resume / prompt</text>
+<text x="812" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">读 bridge-state</text>
+<text x="812" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">session/prompt</text>
+<line x1="962" y1="1098" x2="988" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="990" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="1002" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">⑥ agent 执行</text>
+<text x="1002" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">沙箱内读工作区</text>
+<text x="1002" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">调用工具</text>
+<line x1="1152" y1="1098" x2="1178" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="1180" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="1192" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">⑦ 回复回传</text>
+<text x="1192" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">assistant/message</text>
+<text x="1192" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">turn/end</text>
+<line x1="1342" y1="1098" x2="1368" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="1370" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="1382" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">⑧ sendText</text>
+<text x="1382" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">带 context_token</text>
+<text x="1382" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">超长分段</text>
+<line x1="1532" y1="1098" x2="1558" y2="1098" stroke="#2563eb" stroke-width="1.8" marker-end="url(#m-blue)"/>
+<rect x="1560" y="1048" width="160" height="100" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="1572" y="1075" font-size="13" font-weight="700" fill="#1e3a8a" text-anchor="start">⑨ 微信显示</text>
+<text x="1572" y="1097" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">用户看到回复</text>
+<text x="1572" y="1115" font-size="10.8" font-weight="400" fill="#1e40af" text-anchor="start">回合结束</text>
+<text x="40" y="1176" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">bridge-state.json：peer→sessionId（resume 用）+ context_token（下行用）；SessionStore 每 5s 刷盘</text>
+<text x="40" y="1198" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">dsh-home/sessions/：DSH 会话日志；resume 失败时用同一 sessionId 惰性新建（会失忆，但不报错）</text>
+<text x="40" y="1220" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">agent 自己发的消息在入站时被丢弃，不会回灌上下文；“正在处理中…”只是出站提示，也不进上下文</text>
+<text x="40" y="1262" font-size="16" font-weight="700" fill="#9a3412" text-anchor="start">定时任务流（橙）</text>
+<text x="40" y="1290" font-size="12.5" font-weight="700" fill="#9a3412" text-anchor="start">A. 创建 / 取消 / 暂停</text>
+<rect x="40" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="52" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">① 微信自然语言</text>
+<text x="52" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">「每天 9 点…」</text>
+<text x="52" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">「取消每日一题」</text>
+<line x1="242" y1="1345" x2="278" y2="1345" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="280" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="292" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">② agent 写请求</text>
+<text x="292" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">_tasks/pending/*.json</text>
+<text x="292" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">action = add/rm/...</text>
+<line x1="482" y1="1345" x2="518" y2="1345" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="520" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="532" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">③ fs.watch</text>
+<text x="532" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">监听 pending 目录</text>
+<text x="532" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">150ms 防抖</text>
+<line x1="722" y1="1345" x2="758" y2="1345" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="760" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="772" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">④ 稳定后校验</text>
+<text x="772" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">mtime ≥ 300ms</text>
+<text x="772" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">schema / 时间 / id</text>
+<line x1="962" y1="1345" x2="998" y2="1345" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="1000" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="1012" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">⑤ 写 tasks.json</text>
+<text x="1012" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">沙箱外，权威存储</text>
+<text x="1012" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">唯一事实源</text>
+<line x1="1202" y1="1345" x2="1238" y2="1345" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="1240" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="1252" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">⑥ 桥接回执</text>
+<text x="1252" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">sendText 确认</text>
+<text x="1252" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">成功 / 失败原因</text>
+<line x1="1442" y1="1345" x2="1478" y2="1345" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="1480" y="1300" width="200" height="90" rx="10" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="1492" y="1326" font-size="13" font-weight="700" fill="#9a3412" text-anchor="start">⑦ 微信收到</text>
+<text x="1492" y="1348" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">「已生效」/「未生效」</text>
+<text x="1492" y="1366" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">agent 只说已提交</text>
+<text x="40" y="1418" font-size="12.5" font-weight="700" fill="#9a3412" text-anchor="start">B. 到点触发</text>
+<rect x="40" y="1428" width="230" height="82" rx="10" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="52" y="1452" font-size="12.8" font-weight="700" fill="#9a3412" text-anchor="start">① 准点 timer</text>
+<text x="52" y="1473" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">读 tasks.json 的</text>
+<text x="52" y="1490" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">nextRunAt（60s 兜底）</text>
+<line x1="272" y1="1469" x2="328" y2="1469" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="330" y="1428" width="230" height="82" rx="10" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="342" y="1452" font-size="12.8" font-weight="700" fill="#9a3412" text-anchor="start">② conv.ask(peer, prompt)</text>
+<text x="342" y="1473" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">任务 prompt 进</text>
+<text x="342" y="1490" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">当前会话队列</text>
+<line x1="562" y1="1469" x2="618" y2="1469" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="620" y="1428" width="230" height="82" rx="10" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="632" y="1452" font-size="12.8" font-weight="700" fill="#9a3412" text-anchor="start">③ agent 生成</text>
+<text x="632" y="1473" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">/new 后是新会话</text>
+<text x="632" y="1490" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">不记得旧对话</text>
+<line x1="852" y1="1469" x2="908" y2="1469" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="910" y="1428" width="230" height="82" rx="10" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="922" y="1452" font-size="12.8" font-weight="700" fill="#9a3412" text-anchor="start">④ sendText(token)</text>
+<text x="922" y="1473" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">主动推送到微信</text>
+<text x="922" y="1490" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">需已有 context_token</text>
+<line x1="1142" y1="1469" x2="1198" y2="1469" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="1200" y="1428" width="230" height="82" rx="10" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="1212" y="1452" font-size="12.8" font-weight="700" fill="#9a3412" text-anchor="start">⑤ 微信收到</text>
+<text x="1212" y="1473" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">和普通回复一样</text>
+<text x="1212" y="1490" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">同一聊天窗口</text>
+<line x1="1432" y1="1469" x2="1488" y2="1469" stroke="#ea580c" stroke-width="1.8" marker-end="url(#m-orange)"/>
+<rect x="1490" y="1428" width="230" height="82" rx="10" fill="#fff" stroke="#fdba74" stroke-width="1.5"/>
+<text x="1502" y="1452" font-size="12.8" font-weight="700" fill="#9a3412" text-anchor="start">⑥ markRun</text>
+<text x="1502" y="1473" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">记录结果 / 推进</text>
+<text x="1502" y="1490" font-size="10.8" font-weight="400" fill="#9a3412" text-anchor="start">nextRunAt 并刷盘</text>
+<text x="40" y="1538" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">任务不绑 session：/new 只换 sessionId，tasks.json 不变；到点时注入“当前”会话。若 prompt 依赖历史，状态要落到工作区文件里</text>
+<text x="40" y="1560" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">没有 context_token 时任务推送失败（只记日志），用户发一条消息即可恢复；所有敏感文件 0600，配置目录 0700</text>
+</svg>

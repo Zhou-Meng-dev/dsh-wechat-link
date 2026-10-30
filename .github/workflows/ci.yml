@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json engines 要求 >=22；24 是 Dockerfile 里的版本
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: 语法检查（.mjs）
+        run: npm run lint
+
+      - name: Shell 语法检查
+        run: |
+          bash -n install.sh
+          bash -n sandbox.sh
+          bash -n manage.sh
+          bash -n deploy/install.sh
+          bash deploy/install.sh --help > /dev/null
+          bash install.sh --help > /dev/null
+
+      - name: 单元 / 集成测试
+        run: npm test
+
+  package:
+    name: 打包与 CLI 冒烟
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: 检查 npm 包内容
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e "
+            const files = require('/tmp/pack.json')[0].files.map((f) => f.path);
+            for (const required of ['bin/dsh-wechat-link.mjs', 'src/main.mjs', 'README.md', 'assets/architecture.svg']) {
+              if (!files.includes(required)) {
+                console.error('缺少打包文件: ' + required);
+                process.exit(1);
+              }
+            }
+            console.log('打包内容 OK: ' + files.length + ' 个文件');
+          "
+
+      - name: CLI 冒烟
+        run: |
+          node src/main.mjs version
+          node src/main.mjs --help > /dev/null

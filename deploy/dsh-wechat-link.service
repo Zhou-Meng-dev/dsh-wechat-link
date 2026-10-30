@@ -1,0 +1,42 @@
+[Unit]
+Description=dsh-wechat-link (multi-tenant, bubblewrap sandbox)
+# @REPO@ / @BRIDGE_HOME@ 由 deploy/install.sh 替换；手工安装时用 sed 替换（见 README）。
+Documentation=file://@REPO@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/sandbox.sh
+
+# 崩溃自愈
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=10s
+StartLimitBurst=5
+
+# 优雅停止
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# ---- 资源上限：防止 agent 耗尽宿主 ----
+# 内存：多租户每户约 300M，留足余量但封顶
+MemoryMax=4G
+MemoryHigh=3G
+# CPU：12 核机器上最多用 4 核，避免把宿主拖死
+CPUQuota=400%
+# 进程数：防 fork 炸弹
+TasksMax=512
+
+Environment=NODE_ENV=production
+# 可选：从独立文件加载密钥，避免把 API key 写进 unit 文件。
+# 文件内容形如:  BRIDGE_DEFAULT_API_KEY=sk-xxxx
+# 建议权限 600。文件不存在时 systemd 会用 "-" 前缀忽略，不会导致启动失败。
+EnvironmentFile=-@BRIDGE_HOME@/env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

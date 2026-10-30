@@ -1,0 +1,18 @@
+# 统一换行，避免 WSL / Windows 之间来回转换产生整文件 diff
+* text=auto eol=lf
+
+*.sh  text eol=lf
+*.mjs text eol=lf
+*.js  text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 架构图是可 diff 的 SVG 文本；位图与压缩包按二进制处理
+*.svg text
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.tgz binary

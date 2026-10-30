@@ -1,0 +1,44 @@
+# 推荐：一个容器 = 一个租户（一个微信 bot）。
+# 首次扫码：docker compose run --rm bridge login
+name: dsh-wechat-link
+services:
+  bridge:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-node:24.22.1-bookworm-slim}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        APT_MIRROR: ${APT_MIRROR:-}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    image: dsh-wechat-link:local
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Hong_Kong
+      # 新 bot 登录时继承；已有租户以 secrets.json 里的 apiKey 为准
+      BRIDGE_DEFAULT_API_KEY: ${BRIDGE_DEFAULT_API_KEY:-}
+      BRIDGE_HEALTH_PORT: "8080"
+      BRIDGE_HEALTH_HOST: 0.0.0.0
+    volumes:
+      - bridge-data:/data
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /home/node:size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  bridge-data:
