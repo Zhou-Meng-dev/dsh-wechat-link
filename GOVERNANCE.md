@@ -64,9 +64,17 @@ issue / 明确需求
 1. `CHANGELOG.md` 增加版本小节（日期、Added / Changed / Fixed / Security）。
 2. 同步 `package.json` 与 `src/version.mjs` 的版本号。
 3. `npm run check` 全绿；`npm pack --dry-run` 检查包内容。
-4. 打 tag：`git tag -a vX.Y.Z -m "vX.Y.Z"`。
-5. `npm publish`（需要先配置仓库远端与 npm 凭据）。
-6. 更新本地开发看板 `docs/feature-backlog.md` 的基线表与更新记录（不入库）。
+4. 合并到 `main` 后打 tag 并推送：`git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`。
+   推 tag 会触发 `.github/workflows/publish.yml`：重跑检查、校验 tag 与版本一致、
+   以 `--provenance` 发布；版本已存在时自动跳过。
+5. 自动发布的认证二选一：
+   - **Trusted Publishing（推荐）**：首次手动发布后，在 npm 包设置 → Trusted Publishing
+     绑定 `Zhou-Meng-dev/dsh-wechat-link` 与 `publish.yml`，之后不再需要长期 token；
+   - **`NPM_TOKEN` 仓库 secret**：Granular access token，只给本包 publish 权限并设过期时间。
+   两者都未配置时 workflow 会失败，不会静默跳过发布。
+6. **首次发布仍需手动**：包尚不存在，无法配置 Trusted Publishing。执行 `npm publish`，
+   再把 `vX.Y.Z` tag 移到发布提交；之后推 tag 触发的 workflow 会检测到版本已存在并跳过。
+7. 更新本地开发看板 `docs/feature-backlog.md` 的基线表与更新记录（不入库）。
 
 ## 文档治理
 
