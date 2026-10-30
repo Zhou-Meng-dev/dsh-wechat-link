@@ -6,7 +6,7 @@
 ![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-> **状态：0.1.0，实验阶段。** 真实微信扫码登录与消息往返已验证；可直接 `npm install -g dsh-wechat-link` 安装。生产使用前请先读 [安全模型](#安全模型) 和 [已知限制](#已知限制)。
+> **状态：0.1.1，实验阶段。** 真实微信扫码登录与消息往返已验证；可直接 `npm install -g dsh-wechat-link` 安装。生产使用前请先读 [安全模型](#安全模型) 和 [已知限制](#已知限制)。
 
 ## 它能做什么
 

@@ -3,7 +3,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.1.1] - 2026-10-31
 
 ### Added
 
@@ -13,6 +13,30 @@
 - `_tools/quiz.py`：维护 `_quiz/state.json` 的 pending / 正确 / 错误 / 跳过与连续正确，
   供窗口任务逐题出题、计分；`/new` 和重启后可从状态恢复。
 - 任务跳过标记 `[[skip]]`：agent 返回该标记时只记录历史、不发送消息。
+
+## [0.1.0] - 2026-10-30
+
+首个可用版本：微信 iLink 官方 Bot 通道 ↔ DeepSeek Harness 多租户桥接。
+
+### Added
+
+- 多租户：每租户独立 bot token、`dsh` 子进程、`DSH_HOME`、工作目录与会话；运行时热添加/删除。
+- iLink 长轮询、文本/语音转写/图片/文件/引用消息入站；图片与文件出站（CDN 加密上传）。
+- 同用户消息 FIFO + 500ms 合并；回合串行化，避免并发跑同一用户。
+- Markdown → 微信纯文本；超长回复转文件；长内容分段发送。
+- 定时任务：一次性 / 每日 / 每周 / 固定间隔；按标题管理、暂停恢复、稍后提醒；
+  `taskctl.py` 同步等待 agent 结果；执行历史与失败提示。
+- `context_token` 失效时进入待发队列，下次入站自动补发。
+- 图片归一化：大图压缩、HEIC/BMP/TIFF 转码（Pillow 优先，ImageMagick 兜底）。
+- 每租户 persona / skills / plugins；API key 预设 + 单 bot 覆盖（环境变量注入）。
+- bubblewrap 沙箱、Docker / Kubernetes 部署、`/healthz`、systemd 用户服务。
+- 首次启动依赖自检（doctor）与 API key 配置向导；配置/数据统一到 `~/.dsh-wechat-link/`。
+- Node SEA 单文件 Linux 可执行程序（实验）。
+- npm 分发：`npm install -g dsh-wechat-link` / `npx dsh-wechat-link`；包内排除 Python 缓存等开发产物，部署模板仍只随源码仓库提供。
+- GitHub Actions 自动发布（`.github/workflows/publish.yml`）：推送 `v*` tag 触发，
+  校验 tag/版本、支持 npm Trusted Publishing 或 `NPM_TOKEN`，带 `--provenance`，
+  版本已存在时自动跳过。
+- `cli-sim` 命令行模拟微信消息；覆盖消息队列、Markdown、定时任务、媒体与沙箱参数的测试。
 - 内置命令 `/status`、`/tasks`、`/usage`、`/help`（中英文别名）：由桥接直接处理，
   不经过模型，命令单独成批，token 失效时进待发队列。
 - 用量统计与预算告警：每回合累加 DSH `TokenUsage` 到租户 `usage.json`，
@@ -76,30 +100,6 @@
   bwrap 报 `Can't chdir ...: No such file or directory` 的问题（`src/sandbox/sandbox.mjs`）。
 - 根目录 `install.sh` 删除失效的 macOS launchd 指引，改为指向 systemd 部署脚本。
 - 本地开发看板移除会漂移的测试文件计数，改为可执行命令。
-
-## [0.1.0] - 2026-10-30
-
-首个可用版本：微信 iLink 官方 Bot 通道 ↔ DeepSeek Harness 多租户桥接。
-
-### Added
-
-- 多租户：每租户独立 bot token、`dsh` 子进程、`DSH_HOME`、工作目录与会话；运行时热添加/删除。
-- iLink 长轮询、文本/语音转写/图片/文件/引用消息入站；图片与文件出站（CDN 加密上传）。
-- 同用户消息 FIFO + 500ms 合并；回合串行化，避免并发跑同一用户。
-- Markdown → 微信纯文本；超长回复转文件；长内容分段发送。
-- 定时任务：一次性 / 每日 / 每周 / 固定间隔；按标题管理、暂停恢复、稍后提醒；
-  `taskctl.py` 同步等待 agent 结果；执行历史与失败提示。
-- `context_token` 失效时进入待发队列，下次入站自动补发。
-- 图片归一化：大图压缩、HEIC/BMP/TIFF 转码（Pillow 优先，ImageMagick 兜底）。
-- 每租户 persona / skills / plugins；API key 预设 + 单 bot 覆盖（环境变量注入）。
-- bubblewrap 沙箱、Docker / Kubernetes 部署、`/healthz`、systemd 用户服务。
-- 首次启动依赖自检（doctor）与 API key 配置向导；配置/数据统一到 `~/.dsh-wechat-link/`。
-- Node SEA 单文件 Linux 可执行程序（实验）。
-- npm 分发：`npm install -g dsh-wechat-link` / `npx dsh-wechat-link`；包内排除 Python 缓存等开发产物，部署模板仍只随源码仓库提供。
-- GitHub Actions 自动发布（`.github/workflows/publish.yml`）：推送 `v*` tag 触发，
-  校验 tag/版本、支持 npm Trusted Publishing 或 `NPM_TOKEN`，带 `--provenance`，
-  版本已存在时自动跳过。
-- `cli-sim` 命令行模拟微信消息；覆盖消息队列、Markdown、定时任务、媒体与沙箱参数的测试。
 
 ### Security
 
