@@ -61,3 +61,11 @@ test('npm 包不包含本地开发文档', async () => {
   assert.ok(Array.isArray(pkg.files));
   assert.ok(!pkg.files.includes('docs/'), 'docs/ 是本地开发文档，不应打进 npm 包');
 });
+
+test('npm 包排除 Python 缓存，并显式声明公开访问', async () => {
+  const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
+  // files 白名单会覆盖 .gitignore；不显式排除时 __pycache__ 会被打进 tarball
+  assert.ok(pkg.files.includes('!src/**/__pycache__/**'));
+  assert.ok(pkg.files.includes('!**/*.pyc'));
+  assert.equal(pkg.publishConfig?.access, 'public');
+});

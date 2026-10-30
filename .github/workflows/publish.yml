@@ -1,0 +1,97 @@
+name: Publish
+
+# 推送 v* tag 时自动发布到 npm；也可以在 Actions 页面手动 dry-run。
+# 认证二选一：
+#   1. Trusted Publishing（推荐）：npmjs.com → 包设置 → Trusted Publishing 绑定本仓库与 publish.yml
+#   2. 仓库 secret NPM_TOKEN：Granular access token，仅本包 publish 权限并设过期时间
+# 首次发布需要手动执行（包还不存在时无法配置 Trusted Publishing）。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 只打包校验，不真正发布
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance / Trusted Publishing
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # secrets 不能直接用在 if 里；先抬到 job env，再用 env.HAS_NPM_TOKEN 判断
+  HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - name: 校验 tag 与 package.json 版本一致
+        if: github.ref_type == 'tag'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "❌ tag $tag 与 package.json 的 $pkg 不一致" >&2
+            exit 1
+          fi
+
+      # Trusted Publishing 需要 npm >= 11.5.1
+      - name: 升级 npm
+        run: npm install -g npm@latest
+
+      - name: 检查该版本是否已经发布
+        id: check
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "dry-run：跳过“已发布”检查"
+            exit 0
+          fi
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if npm view "$name@$version" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ $name@$version 已发布，跳过"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "将发布 $name@$version"
+          fi
+
+      - name: 配置 NPM_TOKEN（仅当设置了 secret）
+        if: env.HAS_NPM_TOKEN == 'true'
+        run: echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" >> "$HOME/.npmrc"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: 发布到 npm
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          args="--provenance --access public --registry=https://registry.npmjs.org/"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args="$args --dry-run"
+          fi
+          if [ "$HAS_NPM_TOKEN" = "true" ]; then
+            echo "认证：NPM_TOKEN"
+          else
+            echo "认证：OIDC Trusted Publishing"
+          fi
+          npm publish $args

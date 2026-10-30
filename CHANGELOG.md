@@ -89,6 +89,10 @@
 - bubblewrap 沙箱、Docker / Kubernetes 部署、`/healthz`、systemd 用户服务。
 - 首次启动依赖自检（doctor）与 API key 配置向导；配置/数据统一到 `~/.dsh-wechat-link/`。
 - Node SEA 单文件 Linux 可执行程序（实验）。
+- npm 分发：`npm install -g dsh-wechat-link` / `npx dsh-wechat-link`；包内排除 Python 缓存等开发产物，部署模板仍只随源码仓库提供。
+- GitHub Actions 自动发布（`.github/workflows/publish.yml`）：推送 `v*` tag 触发，
+  校验 tag/版本、支持 npm Trusted Publishing 或 `NPM_TOKEN`，带 `--provenance`，
+  版本已存在时自动跳过。
 - `cli-sim` 命令行模拟微信消息；覆盖消息队列、Markdown、定时任务、媒体与沙箱参数的测试。
 
 ### Security
