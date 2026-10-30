@@ -1,6 +1,6 @@
 {
   "name": "dsh-wechat-link",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "把微信（iLink）接入 DeepSeek Harness 的多租户桥接；支持定时任务、图片/文件与 Docker",
   "engines": {
