@@ -4,8 +4,10 @@
 
 import { existsSync } from 'node:fs';
 
-import { apiKeyFingerprint, bridgeHome, maskKey, resolveDefaultApiKey, sandboxRoot, setupMarkerPath, workspacesRoot } from '../../config.mjs';
+import { bridgeHome, maskKey, resolveDefaultApiKey, sandboxRoot, setupMarkerPath, workspacesRoot } from '../../config.mjs';
+import { createHealthServer } from '../../ops/health.mjs';
 import { assertPreflight } from '../../ops/preflight.mjs';
+import { tenantListKey } from '../../ops/reload.mjs';
 import { runSetup, shouldRunSetup } from '../../ops/setup.mjs';
 import { applySandboxEnv, resolveSandbox } from '../../sandbox/sandbox-env.mjs';
 import { TenantRegistry } from '../../tenant-registry.mjs';
@@ -74,6 +76,11 @@ export async function cmdServe() {
 
   const { config: cfg, secrets, tenants, failures } = await store.resolveAll();
 
+  // 健康检查快照的两部分：配置中的租户总数（含载入失败的）与失败列表。
+  // 热重载时会同步更新，见下面的 reloadTimer。
+  let expectedTenants = cfg.tenants.length;
+  let loadFailures = failures;
+
   log(`桥接根: ${bridgeHome()}`);
   log(`配置: ${CONFIG_PATH}`);
   log(`凭据: ${store.secretsPath}`);
@@ -126,45 +133,38 @@ export async function cmdServe() {
 
   // 容器/K8s 探针：BRIDGE_HEALTH_PORT 设置后暴露 /healthz 与 /readyz。
   // 不设置时完全不监听端口（裸机部署保持原样）。
+  // /healthz 只看进程存活；/readyz 要求配置中的租户全部 running，否则 503。
   let healthServer = null;
   const healthPort = Number(process.env.BRIDGE_HEALTH_PORT ?? 0);
   if (Number.isFinite(healthPort) && healthPort > 0) {
-    const http = await import('node:http');
     const host = process.env.BRIDGE_HEALTH_HOST ?? '127.0.0.1';
-    healthServer = http.createServer((req, res) => {
-      if (req.url !== '/healthz' && req.url !== '/readyz') {
-        res.writeHead(404);
-        res.end('not found\n');
-        return;
-      }
-      const list = registry.list();
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        ok: true,
-        running: list.filter((t) => t.state === 'running').length,
-        tenants: list.map((t) => ({ id: t.id, state: t.state })),
-      }) + '\n');
+    healthServer = createHealthServer({
+      snapshot: () => ({
+        expected: expectedTenants,
+        tenants: registry.list(),
+        failures: loadFailures,
+      }),
+      log: warn,
     });
     healthServer.on('error', (err) => warn(`健康检查端口 ${healthPort} 失败: ${err.message}`));
-    healthServer.listen(healthPort, host, () => log(`健康检查: http://${host}:${healthPort}/healthz`));
+    healthServer.listen(healthPort, host, () => {
+      log(`健康检查: http://${host}:${healthPort}/healthz（存活）、/readyz（就绪）`);
+    });
   }
 
-  // 运行期重载：配置变化（增删租户、改 persona/model/cwd/apikey）自动同步。
-  // 比对整份合并视图，而不仅是 id —— 否则改了 persona 不会生效。
-  // apiKey 只参与比对哈希，绝不把明文放进任何日志或比较结果。
-  const defKey = (list) =>
-    JSON.stringify(
-      [...list]
-        .sort((a, b) => String(a.id).localeCompare(String(b.id)))
-        .map((d) => [
-          d.id, d.cwd, d.model, d.provider, d.persona ?? '', apiKeyFingerprint(d.apiKey),
-        ]),
-    );
-  let lastSeen = defKey(tenants);
+  // 运行期重载：配置变化（增删租户、改 persona/model/cwd/apikey/白名单/预算等）自动同步。
+  // 比对整份合并视图，而不是手写字段清单 —— 新增配置字段不需要再改这里。
+  // token / apiKey 只以指纹参与比较，键里没有明文，也不打印。
+  let lastSeen = tenantListKey(tenants);
   const reloadTimer = setInterval(async () => {
     try {
       const fresh = await store.resolveAll();
-      const key = defKey(fresh.tenants);
+
+      // 健康检查快照：配置里的租户数（含载入失败的）与失败列表
+      expectedTenants = fresh.config.tenants.length;
+      loadFailures = fresh.failures;
+
+      const key = tenantListKey(fresh.tenants);
       if (key === lastSeen) return;
       lastSeen = key;
 
@@ -184,7 +184,7 @@ export async function cmdServe() {
       // 配置变更 → 重启该租户
       for (const tenant of fresh.tenants) {
         const existing = registry.get(tenant.id);
-        if (existing && defKey([existing.tenant]) !== defKey([tenant])) {
+        if (existing && tenantListKey([existing.tenant]) !== tenantListKey([tenant])) {
           log(`租户 ${tenant.id} 配置已变更，重启中…`);
           await registry.remove(tenant.id).catch(() => {});
           await registry.add(tenant).catch((e) => warn(`重启 ${tenant.id} 失败: ${e.message}`));

@@ -55,9 +55,16 @@
 - npm 包不包含本地开发文档 `docs/`；`docs/` 只保留在维护者本地。
 - `prepublishOnly` 从只跑测试改为 `npm run check`（语法 + 测试）。
 - `src/` 按能力分组为 `agent/`、`wechat/`、`tasks/`、`sandbox/`、`ops/`；仅移动文件与改 import，模块接口不变。
+- 配置热重载改为比较整份租户视图（`src/ops/reload.mjs`）：新增配置字段自动进入比对，
+  token / apiKey 只以指纹参与，键不打印、不落盘。
+- K8s 模板的 `readinessProbe` 改用 `/readyz`，`livenessProbe` 保持 `/healthz`。
 
 ### Fixed
 
+- 热重载漏字段：`allowUsers`、`maxChars`、`ackDelayMs`、日/月 token 预算、`baseUrl`、
+  `dshHome` 以及 token 轮换现在都会触发对应租户重启，不再需要手动重启服务。
+- `/healthz` 与 `/readyz` 语义分离：`/healthz` 只表示进程存活；`/readyz` 仅在配置中的
+  租户全部 `running` 时返回 200，无租户 / 载入失败 / 租户未运行时返回 503 并带 `reason`。
 - `src/tenant.mjs` 的家目录回退改为 `os.homedir()`，不再硬编码某用户的绝对路径。
 - 修复 `BRIDGE_HOME` 位于 `/tmp` 下时，`--tmpfs /tmp` 覆盖已 bind 的工作目录，
   bwrap 报 `Can't chdir ...: No such file or directory` 的问题（`src/sandbox/sandbox.mjs`）。

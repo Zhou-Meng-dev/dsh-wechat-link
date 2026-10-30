@@ -204,6 +204,15 @@ curl http://127.0.0.1:8080/healthz
 
 一个容器一个租户；多租户模板见 [`deploy/docker-compose.tenants.example.yml`](deploy/docker-compose.tenants.example.yml)。
 
+**健康检查**（设置 `BRIDGE_HEALTH_PORT` 后监听；默认不监听端口）
+
+| 端点 | 语义 | 返回 |
+|---|---|---|
+| `/healthz` | 存活：进程能响应 | 永远 200（没有租户也存活） |
+| `/readyz` | 就绪：配置中的租户是否全部 `running` | 全部运行 200；无租户、载入失败、租户未运行/登录失效时 503，响应体带 `reason` |
+
+K8s 模板里 `readinessProbe` 用 `/readyz`，`livenessProbe` 用 `/healthz`。
+
 **Kubernetes**：`deploy/k8s/` 下有 deployment / pvc / secret / login job 模板。
 
 **单文件 SEA**（实验）：
