@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsh-wechat-link
+  labels:
+    app: dsh-wechat-link
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # PVC 是 RWO，避免滚动时两个 Pod 同时挂载
+  selector:
+    matchLabels:
+      app: dsh-wechat-link
+  template:
+    metadata:
+      labels:
+        app: dsh-wechat-link
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          image: dsh-wechat-link:local     # 生产环境换成 registry 镜像
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TZ
+              value: Asia/Hong_Kong
+            - name: BRIDGE_HEALTH_PORT
+              value: "8080"
+            - name: BRIDGE_HEALTH_HOST
+              value: 0.0.0.0
+          envFrom:
+            - secretRef:
+                name: dsh-wechat-link-secrets
+                optional: true
+          ports:
+            - name: health
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/node
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dsh-wechat-link-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: home
+          emptyDir:
+            sizeLimit: 128Mi

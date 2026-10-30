@@ -1,0 +1,33 @@
+# 配置/凭据的默认位置是 ~/.dsh-wechat-link（不在仓库内）。
+# 下面几条只是防止误拷进仓库；含 bot token / API key，绝不能入库。
+.config.json
+.secrets.json
+config.json
+secrets.json
+
+# 备份与原子写临时文件（同样可能含秘密）
+*.bak
+*.tmp-*
+
+# ---- 运行时产物 ----
+node_modules/
+*.log
+.env
+
+# Python 缓存（doc_probe.py 的 py_compile / 运行产物）
+__pycache__/
+*.pyc
+
+# ---- 本机 Docker Compose ----
+# 每台机器的租户 ID / 端口不同，按机器生成，不入库
+docker-compose.tenants.yml
+
+# 管理脚本生成的卷备份（含凭据）
+backups/
+
+# 构建产物 / 本地 npm 缓存
+build/
+.npm-cache/
+
+# 开发文档
+docs

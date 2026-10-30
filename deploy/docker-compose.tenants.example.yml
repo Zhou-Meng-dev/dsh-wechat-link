@@ -1,0 +1,59 @@
+# 一租户一容器示例（把 t-example-a / t-example-b 换成真实租户 id）。
+#
+# 前提：
+#   1. 镜像已构建：docker build -t dsh-wechat-link:local .
+#   2. 每个租户的数据卷已存在，且卷内只有该租户：
+#        /data/.dsh-wechat-link/{config.json,secrets.json,setup.json,deploy.env}
+#        /data/.dsh-wechat-link/tenants/<id>/...
+#        /data/.dsh-wechat-link/workspace/<id>/...
+#   3. 不要把同一个卷挂给两个容器；也不要把两个租户塞进同一个 /data。
+#
+# 新增 bot：复制一组 service + volume，不要在已有容器里 login 第二个租户。
+# 使用：docker compose -f docker-compose.tenants.yml up -d
+x-common: &common
+  image: dsh-wechat-link:local
+  restart: unless-stopped
+  environment:
+    TZ: Asia/Hong_Kong
+    BRIDGE_HEALTH_PORT: "8080"
+    BRIDGE_HEALTH_HOST: 0.0.0.0
+  read_only: true
+  tmpfs:
+    - /tmp:size=256m
+    - /home/node:size=128m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+
+services:
+  bridge-t-example-a:
+    <<: *common
+    container_name: dsh-wechat-link-t-example-a
+    volumes:
+      - dsh-wechat-link-t-example-a-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  bridge-t-example-b:
+    <<: *common
+    container_name: dsh-wechat-link-t-example-b
+    volumes:
+      - dsh-wechat-link-t-example-b-data:/data
+    ports:
+      - "127.0.0.1:8081:8080"
+
+volumes:
+  dsh-wechat-link-t-example-a-data:
+    name: dsh-wechat-link-t-example-a-data
+    external: true
+  dsh-wechat-link-t-example-b-data:
+    name: dsh-wechat-link-t-example-b-data
+    external: true
