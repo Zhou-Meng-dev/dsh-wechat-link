@@ -86,7 +86,12 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           args="--provenance --access public --registry=https://registry.npmjs.org/"
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          # 只有手动触发才看 dry_run；tag push 的 inputs 上下文不可靠
+          dry_run="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            dry_run="true"
+          fi
+          if [ "$dry_run" = "true" ]; then
             args="$args --dry-run"
           fi
           if [ "$HAS_NPM_TOKEN" = "true" ]; then
@@ -94,4 +99,5 @@ jobs:
           else
             echo "认证：OIDC Trusted Publishing"
           fi
+          echo "执行: npm publish $args"
           npm publish $args
