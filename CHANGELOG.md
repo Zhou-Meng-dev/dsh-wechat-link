@@ -7,6 +7,12 @@
 
 ### Added
 
+- 窗口随机任务（`schedule.kind = "window"`）：支持任意 `start`/`end` 与 `count`，
+  窗口内分层随机生成触发点；同一天时间固定、重启不重抽，错过的点跳过。
+  CLI：`task <id> add --window "08:00-23:00" --count 10`。
+- `_tools/quiz.py`：维护 `_quiz/state.json` 的 pending / 正确 / 错误 / 跳过与连续正确，
+  供窗口任务逐题出题、计分；`/new` 和重启后可从状态恢复。
+- 任务跳过标记 `[[skip]]`：agent 返回该标记时只记录历史、不发送消息。
 - 内置命令 `/status`、`/tasks`、`/usage`、`/help`（中英文别名）：由桥接直接处理，
   不经过模型，命令单独成批，token 失效时进待发队列。
 - 用量统计与预算告警：每回合累加 DSH `TokenUsage` 到租户 `usage.json`，

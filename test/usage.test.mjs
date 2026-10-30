@@ -168,9 +168,12 @@ await check('CLI usage：默认/--day/--json 都能读到租户 usage.json', asy
     tenants: { [tenantId]: { token: 'bot123@im.bot:secret' } },
   }, null, 2));
 
-  const cliStore = new UsageStore({ path: join(tenantRoot, 'usage.json'), now: () => day1 });
+  // 默认输出用的是“今天”，测试机跨天时不能写死日期
+  const cliDay = new Date();
+  const cliKey = dayKey(cliDay);
+  const cliStore = new UsageStore({ path: join(tenantRoot, 'usage.json'), now: () => cliDay });
   cliStore.record({
-    at: day1,
+    at: cliDay,
     model: 'deepseek-flash',
     usage: { inputTokens: 1234, outputTokens: 66 },
   });
@@ -186,13 +189,13 @@ await check('CLI usage：默认/--day/--json 都能读到租户 usage.json', asy
   const normal = await run([]);
   assert.strictEqual(normal.code, 0, normal.stderr);
   assert.match(normal.stdout, /租户 bot123@im\.bot 用量/);
-  assert.match(normal.stdout, /今日 2026-10-30/);
+  assert.ok(normal.stdout.includes(`今日 ${cliKey}`), normal.stdout);
   assert.match(normal.stdout, /1,300 tokens/);
 
-  const json = await run(['--day', '2026-10-30', '--json']);
+  const json = await run(['--day', cliKey, '--json']);
   assert.strictEqual(json.code, 0, json.stderr);
   const parsed = JSON.parse(json.stdout);
-  assert.strictEqual(parsed.day.key, '2026-10-30');
+  assert.strictEqual(parsed.day.key, cliKey);
   assert.strictEqual(parsed.day.totalTokens, 1300);
 
   const bad = await run(['--day', '2026/10/30']);

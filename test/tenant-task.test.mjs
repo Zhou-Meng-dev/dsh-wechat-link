@@ -124,6 +124,26 @@ await check('任务成功：记录结果但不额外打扰用户', async () => {
   assert.strictEqual(entry.taskId, task.id);
 });
 
+await check('任务返回 [[skip]]：记录结果但不发送消息', async () => {
+  sent.length = 0;
+  const task = t.taskRuntime.tasks.add({
+    schedule: { kind: 'daily', time: '11:00' },
+    prompt: '出题',
+    title: '跳过任务',
+  });
+  await t.taskRuntime.tasks.flush();
+
+  t.session.ask = async () => '[[skip]]';
+  await t.runTaskNow(task.id);
+
+  assert.strictEqual(sent.length, 0, 'skip 不应发送任何消息');
+  assert.strictEqual(t.taskRuntime.tasks.get(task.id).lastResult, 'skipped');
+  const entry = t.taskRuntime.taskHistory.list().at(-1);
+  assert.strictEqual(entry.ok, true);
+  assert.strictEqual(entry.delivery, 'skipped');
+  assert.strictEqual(entry.result, 'skipped');
+});
+
 await check('任务不存在时 runTaskNow 返回 false', async () => {
   assert.strictEqual(await t.runTaskNow('task-nope'), false);
 });

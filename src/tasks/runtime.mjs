@@ -20,12 +20,15 @@ import { existsSync, watch } from 'node:fs';
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { TaskStore, formatNextRun, nextDueDelay } from './tasks.mjs';
+import { TaskStore, formatNextRun, nextDueDelay, WINDOW_MISSED_GRACE_MS } from './tasks.mjs';
 import {
   TaskHistory,
   formatTaskFailureNotice,
   writeTaskHistorySnapshot,
 } from './task-history.mjs';
+
+/** agent 用这个标记表示“本次触发不打扰用户”，例如上一题还没回答。 */
+export const TASK_SKIP_MARKER = '[[skip]]';
 
 export class TaskRuntime {
   /**
@@ -194,7 +197,22 @@ export class TaskRuntime {
         this.#scheduleReconcile(350);
       }
 
-      for (const task of this.tasks.due()) {
+      const now = Date.now();
+      for (const task of this.tasks.due(now)) {
+        // 窗口任务错过的点不补发：直接推进到下一个未来时间点
+        if (
+          task.schedule?.kind === 'window'
+          && typeof task.nextRunAt === 'number'
+          && now - task.nextRunAt > WINDOW_MISSED_GRACE_MS
+        ) {
+          const next = this.tasks.skipMissed(task.id, now);
+          this.log(
+            `[task] ⏭ 跳过已错过的窗口时间「${task.title}」`
+            + `${next ? `，下次 ${formatNextRun(next)}` : ''}`,
+          );
+          if (next) await this.#flushTasks().catch(() => {});
+          continue;
+        }
         await this.runNow(task.id);
       }
 
@@ -310,6 +328,20 @@ export class TaskRuntime {
     try {
       const reply = await this.ask(peer, task.prompt);
       if (!reply) throw new Error('agent 未返回内容');
+
+      // agent 明确表示本次不打扰（例如上一题还没回答）：记录但不发送
+      if (String(reply).trim() === TASK_SKIP_MARKER) {
+        this.tasks.markRun(task.id, { ok: true, result: 'skipped' });
+        await this.#recordTaskRun(task, {
+          ok: true,
+          result: 'skipped',
+          delivery: 'skipped',
+          durationMs: Date.now() - startedAt,
+        });
+        this.log(`[task] ⏭ 「${task.title}」本次跳过（agent 返回 ${TASK_SKIP_MARKER}）`);
+        return;
+      }
+
       const delivery = await this.reply.send(peer, reply, token);
       const queued = delivery.queued > 0;
       const result = queued ? `queued:${delivery.queued}` : 'ok';

@@ -41,9 +41,10 @@ DSH × 微信桥接（多租户）
   ${P} task <id> add --daily "09:00" --prompt "..."
   ${P} task <id> add --weekly "1,3,5 09:00" --prompt "..."   （周一三五）
   ${P} task <id> add --every 60 --prompt "..."
+  ${P} task <id> add --window "08:00-23:00" --count 10 --prompt "..."   （窗口内分层随机）
   ${P} task <id> rm <taskId|标题>
   ${P} task <id> enable|disable <taskId|标题>
-  ${P} task <id> update <taskId|标题> --daily "08:00"
+  ${P} task <id> update <taskId|标题> --daily "08:00" | --window "08:00-23:00" --count 10
   ${P} task <id> snooze <taskId|标题> [--minutes 10]
 
 用量统计:

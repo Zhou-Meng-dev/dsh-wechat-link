@@ -15,7 +15,7 @@
 - **图片**：下载解密、大图压缩、BMP/TIFF/HEIC/AVIF 转码，原图留存；送入支持视觉的模型。
 - **文件**：落盘到工作区，只给路径/类型/大小；内置 `doc_probe.py` 按需探测 PDF/XLSX/DOCX/CSV，扫描件自动 OCR。
 - **链接**：抓取正文并落盘；SSRF 防护；同一会话重复链接只注入路径。
-- **定时任务**：一次、每天、每周、固定间隔；到点由 agent 生成内容并主动推送。
+- **定时任务**：一次、每天、每周、固定间隔、窗口内分层随机；到点由 agent 生成内容并主动推送。
 - **主动发媒体**：agent 生成图片/文件后，用 `[[image:]]` / `[[file:]]` 发回微信。
 - **每 bot 独立**：persona、技能、插件、模型和 API key 都可单独配置。
 - **运维**：`/status`、`/usage`、用量/预算、健康检查、systemd、Docker/K8s、单文件 SEA。
@@ -152,10 +152,14 @@ node src/main.mjs task <id> add --at "2026-10-28 12:30" --prompt "..."
 node src/main.mjs task <id> add --daily "09:00" --prompt "..."
 node src/main.mjs task <id> add --weekly "1,3,5 09:00" --prompt "..."
 node src/main.mjs task <id> add --every 60 --prompt "..."
+node src/main.mjs task <id> add --window "08:00-23:00" --count 10 --prompt "..."
 node src/main.mjs task <id> rm|enable|disable|update|snooze ...
 ```
 
 - `prompt` 是给未来 agent 的指令，不是最终发给用户的文字；到点会带着当时的上下文生成回复。
+- **窗口随机**：`--window "08:00-23:00" --count 10` 会把窗口切成 10 个等长槽，每槽随机取一个时间点；同一天时间固定（重启不重抽），错过的点跳过，不补发。
+- 窗口任务适合「每天随机考我几次」：每次触发只问一道题；agent 用工作区 `_tools/quiz.py` 维护 `_quiz/state.json`（当前题目、分数、历史）。如果上一题还没回答，agent 只输出 `[[skip]]`，桥接不会发送消息。
+- `/new` 只清对话上下文和链接缓存，**不会**删除 `tasks.json`、任务历史或 `_quiz/` 里的计分；下一次触发会从状态文件恢复。
 - 任务历史写入 `task-history.json` 和 `_tasks/history.json`；失败会给 owner 发可操作提示。
 - 主动推送依赖 `context_token`；token 失效时消息进 `outbox.json`，用户下次发消息后补发，不丢。
 
