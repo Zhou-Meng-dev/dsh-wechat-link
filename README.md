@@ -6,7 +6,7 @@
 ![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-> **状态：0.1.0，实验阶段。** 真实微信扫码登录与消息往返已验证；npm 包尚未发布，目前从源码安装。生产使用前请先读 [安全模型](#安全模型) 和 [已知限制](#已知限制)。
+> **状态：0.1.0，实验阶段。** 真实微信扫码登录与消息往返已验证；可直接 `npm install -g dsh-wechat-link` 安装。生产使用前请先读 [安全模型](#安全模型) 和 [已知限制](#已知限制)。
 
 ## 它能做什么
 
@@ -52,11 +52,23 @@ iLink bot 在微信里是插件形态，只支持 **1 对 1 私聊**；协议没
 | Pillow / poppler / tesseract | 可选；图片压缩转码 / PDF / OCR |
 | matplotlib / graphviz / qrencode | 可选；图表、流程图、二维码 |
 
-`node src/main.mjs doctor` 会逐项检查并给出安装建议；`doctor --check` 只检查、不创建目录。
+`dsh-wechat-link doctor`（源码运行用 `node src/main.mjs doctor`）会逐项检查并给出安装建议；`doctor --check` 只检查、不创建目录。
 
-## 安装（从源码）
+## 安装
 
-npm 包尚未发布；目前从源码运行：
+**npm（推荐）**
+
+```bash
+npm install -g dsh-wechat-link
+dsh-wechat-link doctor          # 检查 Node / dsh / 凭据 / bwrap / 可选工具
+```
+
+- 需要 Node.js ≥ 22；DSH 需单独安装（`@deepseek-ai/dsh`，≥ 0.2.0）。
+- 运行期没有 npm 依赖；bwrap、Python、Pillow、poppler、tesseract、图表工具按需安装，`doctor` 会逐项提示。
+- 升级：`npm install -g dsh-wechat-link@latest`。
+- 也可以临时运行 `npx dsh-wechat-link -h`；常驻服务仍建议全局安装。
+
+**从源码**（开发，或需要使用 `deploy/` 下的 systemd / Docker / K8s 模板时）
 
 ```bash
 git clone git@github.com:Zhou-Meng-dev/dsh-wechat-link.git
@@ -66,20 +78,20 @@ npm ci
 
 - `npm ci` 只安装构建期依赖（esbuild / postject）；运行期没有 npm 依赖。
 - 配置、凭据、租户数据都在 `~/.dsh-wechat-link/`（可用 `BRIDGE_HOME` 覆盖）。
-- 首次直接运行 `node src/main.mjs` 会先做依赖自检，再引导设置 API key；非交互环境可设 `BRIDGE_DEFAULT_API_KEY`。
-- 发布后可用：`npm install -g dsh-wechat-link` 或 `npx dsh-wechat-link`。
+- 首次直接运行会先做依赖自检，再引导设置 API key；非交互环境可设 `BRIDGE_DEFAULT_API_KEY`。
 
 ## 快速开始
 
 ```bash
-node src/main.mjs doctor          # 检查 node/dsh/凭据/bwrap/可选工具
-node src/main.mjs login           # 扫码；服务运行中也可以
-node src/main.mjs                 # 常驻运行
-node src/main.mjs list            # 查看租户
-node src/main.mjs rm <id>         # 删除租户
-node src/main.mjs -h              # 全部命令
+dsh-wechat-link doctor          # 检查 node/dsh/凭据/bwrap/可选工具
+dsh-wechat-link login           # 扫码；服务运行中也可以
+dsh-wechat-link                 # 常驻运行
+dsh-wechat-link list            # 查看租户
+dsh-wechat-link rm <id>         # 删除租户
+dsh-wechat-link -h              # 全部命令
 ```
 
+- 源码运行时把 `dsh-wechat-link` 换成 `node src/main.mjs`。
 - `login --cwd DIR`：指定该 bot 的工作目录。
 - 服务每 3 秒检测配置变化；新增/删除租户、改 persona/技能/插件后只重启对应租户。
 - 微信里发 `/help` 可看内置命令；这些命令不经过模型。
@@ -184,6 +196,8 @@ node src/main.mjs task <id> rm|enable|disable|update|snooze ...
 
 ## 部署
 
+> 下面的 systemd / Docker / K8s 模板在源码仓库的 `deploy/` 里，**不包含在 npm 包中**；使用这些方式请先 clone 仓库。npm 全局安装后直接用 `dsh-wechat-link` 常驻运行即可。
+
 **systemd（Linux）**
 
 ```bash
@@ -230,7 +244,7 @@ npm run build:sea
 - 微信单条消息有长度上限；超长回复会自动分段，更大的内容转文件发送。
 - DSH 0.2.x 的沙箱主要限制写，不限制读；这是模型工具层的边界，不等于完整安全隔离。
 - OCR / 图表 / 二维码依赖宿主工具；缺失时明确降级，不会自动安装。
-- npm 包尚未发布；目前只能从源码运行。systemd 部署仅适用于 Linux；macOS 需自行改写为 launchd，且 bwrap 不可用。
+- systemd 部署仅适用于 Linux；macOS 需自行改写为 launchd，且 bwrap 不可用。
 
 ## 开发
 

@@ -27,11 +27,16 @@
   "files": [
     "bin/",
     "src/",
+    "!src/**/__pycache__/**",
+    "!**/*.pyc",
     "examples/",
     "assets/",
     "README.md",
     "scripts/"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "wechat",
     "weixin",
