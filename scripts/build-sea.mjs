@@ -60,6 +60,7 @@ writeFileSync(CONFIG, JSON.stringify({
   assets: {
     'examples/persona.md': join(ROOT, 'examples', 'persona.md'),
     'src/tasks/taskctl.py': join(ROOT, 'src', 'tasks', 'taskctl.py'),
+    'src/tasks/quiz.py': join(ROOT, 'src', 'tasks', 'quiz.py'),
     'src/agent/doc-probe.py': join(ROOT, 'src', 'agent', 'doc-probe.py'),
   },
 }, null, 2));

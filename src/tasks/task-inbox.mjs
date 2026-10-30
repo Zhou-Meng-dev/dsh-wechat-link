@@ -17,7 +17,7 @@ import { mkdir, readFile, readdir, writeFile, rename, rm } from 'node:fs/promise
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { computeNextRun, describeSchedule, formatNextRun } from './tasks.mjs';
+import { computeNextRun, describeSchedule, formatNextRun, validateWindowSchedule } from './tasks.mjs';
 import { assetFilePath } from '../assets.mjs';
 
 /** 注入到 system prompt 末尾的能力说明（personaSuffix） */
@@ -34,11 +34,12 @@ export const TASK_CAPABILITY_PROMPT = `## 定时任务
   "prompt": "到点时要执行的指令"
 }
 
-schedule 支持四种：
+schedule 支持五种：
 - {"kind":"once","at":"2026-10-29 12:30"}              一次性，本地时间
 - {"kind":"daily","time":"09:00"}                       每天固定时刻
 - {"kind":"weekly","days":[1,3,5],"time":"09:00"}       每周指定星期（1=周一 … 7=周日）
 - {"kind":"every","minutes":60}                         每隔 N 分钟
+- {"kind":"window","start":"08:00","end":"23:00","count":10}  每天窗口内分层随机 N 次
 
 用户说「每周五」「每周一三五」「工作日」「周末」时用 weekly。
 days 可以写数组 [5]，也可以写字符串 "周一,周五" 或 "工作日"。
@@ -56,6 +57,32 @@ prompt 字段写的是**给未来自己的指令**，不是最终发给用户的
 {"action":"rm","title":"每日一题"}。标题匹配到多个任务时桥接会拒绝并列出候选，
 这时先用 _tasks/current.json 里的 id 再发一次。
 用户说「10 分钟后再提醒」时用 snooze；如果只有一条任务，可以省略 id/title。
+
+### 窗口随机任务（每天 N 次，每次一题）
+
+用户要「每天 8:00–23:00 之间随机考我 10 题」时，用 window schedule：
+
+{"kind":"window","start":"08:00","end":"23:00","count":10}
+
+- 窗口和数量都可以改；start 必须早于 end（不支持跨午夜），count ≤ 窗口分钟数。
+- 桥接会把窗口切成 count 个等长槽，每槽随机取一个时间点；**错过的点会跳过**。
+- 每个时间点触发一次；一次只问一道题，不要一次问 10 道。
+
+每次触发按这个顺序做：
+
+1. 运行 \`python3 _tools/quiz.py pending\`。
+2. 退出码 0：上一题还没回答，本次不打扰用户，**只输出一行 \`[[skip]]\`**，不要问新题。
+3. 退出码非 0：从题库挑一道没考过的题，运行
+   \`python3 _tools/quiz.py ask --question "题目" --answer "参考答案"\` 登记，
+   然后只问这一题。
+
+用户回答后：
+
+- 判断对错，运行 \`python3 _tools/quiz.py record correct\` 或
+  \`python3 _tools/quiz.py record wrong --note "错因"\`。
+- 答错或答不出必须详细解释；再用 \`python3 _tools/quiz.py status\` 把当前分数告诉用户。
+- **不要主动问下一题**，下一题由下一次窗口触发负责。
+- \`/new\` 或服务重启后先 \`quiz.py status\` 恢复进度，不要凭记忆。
 
 查看已有任务：读 _tasks/current.json（含 id / title / schedule / nextRunAt / lastResult，任务变化时桥接会刷新）。
 
@@ -205,6 +232,10 @@ function applyRequest(store, req, log) {
     if (!req.schedule || typeof req.schedule !== 'object') {
       throw new Error('缺少 schedule');
     }
+    if (req.schedule.kind === 'window') {
+      const err = validateWindowSchedule(req.schedule);
+      if (err) throw new Error(`window schedule 非法: ${err}`);
+    }
     const prompt = String(req.prompt ?? '').trim();
     if (!prompt) throw new Error('缺少 prompt');
     if (prompt.length > 8000) throw new Error('prompt 过长（上限 8000 字）');
@@ -240,7 +271,11 @@ function applyRequest(store, req, log) {
     const task = resolveTarget(store, req, action);
     const schedule = scheduleFromRequest(req);
     if (!schedule) {
-      throw new Error('update 需要 schedule（或 at / daily / every 简写）');
+      throw new Error('update 需要 schedule（或 at / daily / every / window 简写）');
+    }
+    if (schedule.kind === 'window') {
+      const err = validateWindowSchedule(schedule);
+      if (err) throw new Error(`window schedule 非法: ${err}`);
     }
     const next = computeNextRun(schedule, Date.now());
     if (!next) throw new Error(`schedule 无法解析: ${JSON.stringify(schedule)}`);
@@ -294,6 +329,36 @@ function scheduleFromRequest(req) {
       : null;
   }
   if (req.every !== undefined) return { kind: 'every', minutes: Number(req.every) };
+  if (req.window) {
+    // 简写：{"window":"08:00-23:00","count":10}
+    if (typeof req.window === 'object') {
+      return {
+        kind: 'window',
+        start: req.window.start,
+        end: req.window.end,
+        count: Number(req.count ?? req.window.count ?? 1),
+        spacing: req.spacing ?? req.window.spacing ?? 'stratified',
+      };
+    }
+    const m = String(req.window).match(/^(\d{1,2}:\d{2})\s*[-–~]\s*(\d{1,2}:\d{2})$/);
+    if (!m) return null;
+    return {
+      kind: 'window',
+      start: m[1],
+      end: m[2],
+      count: Number(req.count ?? 1),
+      spacing: req.spacing ?? 'stratified',
+    };
+  }
+  if (req.kind === 'window') {
+    return {
+      kind: 'window',
+      start: req.start,
+      end: req.end,
+      count: Number(req.count ?? 1),
+      spacing: req.spacing ?? 'stratified',
+    };
+  }
   if (req.kind) {
     return {
       kind: req.kind,

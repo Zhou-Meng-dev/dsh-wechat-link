@@ -54,7 +54,7 @@ export class TaskHistory {
    * @param {boolean} entry.ok
    * @param {string} [entry.result]
    * @param {number} [entry.durationMs]
-   * @param {string} [entry.delivery] - sent / queued / failed
+   * @param {string} [entry.delivery] - sent / queued / failed / skipped
    */
   append(entry) {
     this.entries.push({

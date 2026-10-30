@@ -28,6 +28,149 @@ const VERSION = 1;
  */
 export const DUE_GRACE_MS = 1_000;
 
+/** 窗口任务最多一天触发多少次，避免误配把调度器打爆。 */
+export const MAX_WINDOW_COUNT = 100;
+
+/**
+ * 窗口任务错过多久就不再补发。
+ * 例如 08:37 的点，服务 08:45 才恢复：超过 5 分钟直接跳过，等下一个点。
+ */
+export const WINDOW_MISSED_GRACE_MS = 5 * 60_000;
+
+const CLOCK_RE = /^(\d{1,2}):(\d{2})$/;
+
+/** "08:30" → 510；非法返回 null */
+function parseClockMinutes(value) {
+  const m = CLOCK_RE.exec(String(value ?? '').trim());
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (hh > 23 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
+/**
+ * 校验 window schedule。合法返回 null，非法返回可读错误。
+ *
+ * 目前只支持同一天内的窗口（start < end），不支持跨午夜；
+ * 需要跨午夜就建两个任务。
+ *
+ * @param {object} schedule
+ * @returns {string|null}
+ */
+export function validateWindowSchedule(schedule) {
+  if (!schedule || schedule.kind !== 'window') return '不是 window schedule';
+  const start = parseClockMinutes(schedule.start);
+  const end = parseClockMinutes(schedule.end);
+  if (start === null) return 'start 必须是 HH:MM';
+  if (end === null) return 'end 必须是 HH:MM';
+  if (start >= end) return 'start 必须早于 end（不支持跨午夜窗口）';
+
+  const count = Number(schedule.count);
+  if (!Number.isInteger(count) || count < 1) return 'count 必须是正整数';
+  if (count > MAX_WINDOW_COUNT) return `count 不能超过 ${MAX_WINDOW_COUNT}`;
+  if (count > end - start) return 'count 不能超过窗口的分钟数';
+
+  const spacing = schedule.spacing ?? 'stratified';
+  if (spacing !== 'stratified') return '目前只支持 spacing=stratified';
+  return null;
+}
+
+/** FNV-1a 32 位哈希，用于把任务 id + 日期变成稳定种子。 */
+function hash32(text) {
+  let h = 0x811c9dc5;
+  const s = String(text);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/** mulberry32：小而稳定的 PRNG，同一种子结果固定。 */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function rand() {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function localDayStart(ts) {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function localDayKey(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * 生成某一天的窗口触发时间。
+ *
+ * 分层随机：把 [start, end) 切成 count 个等长槽，每槽内均匀取一个时刻。
+ * 同一 seed + 同一天结果固定，所以服务重启不会重新抽时间。
+ *
+ * @param {object} schedule - {kind:'window', start, end, count, spacing?}
+ * @param {number} dayStartMs - 当天本地 00:00 的时间戳
+ * @param {string} [seed] - 任务 id；不同任务拿到不同随机序列
+ * @returns {number[]|null}
+ */
+export function computeWindowTimes(schedule, dayStartMs, seed = '') {
+  if (validateWindowSchedule(schedule)) return null;
+
+  const start = parseClockMinutes(schedule.start);
+  const end = parseClockMinutes(schedule.end);
+  const count = Number(schedule.count);
+  const total = end - start;
+  const slot = total / count;
+  const rand = mulberry32(hash32(
+    `${seed}|${localDayKey(dayStartMs)}|${schedule.start}|${schedule.end}|${count}`,
+  ));
+
+  const times = [];
+  for (let i = 0; i < count; i++) {
+    const offset = Math.floor(rand() * slot);
+    const minute = Math.floor(start + i * slot + offset);
+    times.push(dayStartMs + minute * 60_000);
+  }
+  return times;
+}
+
+/**
+ * 窗口任务的下一次运行：优先今天剩余的槽位，全部错过则顺延到明天。
+ * 从 `from` 之后严格取下一个点，因此自然实现了“错过跳过”。
+ *
+ * @param {object} schedule
+ * @param {number} [from]
+ * @param {string} [seed]
+ * @returns {number|null}
+ */
+export function computeNextWindowRun(schedule, from = Date.now(), seed = '') {
+  if (validateWindowSchedule(schedule)) return null;
+
+  let day = localDayStart(from);
+  // 最多看 3 天：今天剩余 + 明天 + 极端时区/时钟跳变保险
+  for (let i = 0; i < 3; i++) {
+    const times = computeWindowTimes(schedule, day, seed);
+    if (!times) return null;
+    const next = times.find((t) => t > from);
+    if (next !== undefined) return next;
+
+    const d = new Date(day);
+    d.setDate(d.getDate() + 1);
+    d.setHours(0, 0, 0, 0);
+    day = d.getTime();
+  }
+  return null;
+}
+
 /**
  * 解析 "YYYY-MM-DD HH:mm" 或 ISO 字符串为时间戳。
  * 不带时区的按**本地时区**解释。
@@ -58,8 +201,12 @@ export function parseWhen(input) {
  * @param {number} [from]   - 基准时间戳，默认现在
  * @returns {number|null}
  */
-export function computeNextRun(schedule, from = Date.now()) {
+export function computeNextRun(schedule, from = Date.now(), opts = {}) {
   if (!schedule || typeof schedule !== 'object') return null;
+
+  if (schedule.kind === 'window') {
+    return computeNextWindowRun(schedule, from, opts.seed ?? '');
+  }
 
   if (schedule.kind === 'once') {
     const at = typeof schedule.at === 'number' ? schedule.at : parseWhen(schedule.at);
@@ -184,6 +331,9 @@ export function describeSchedule(s) {
     return `每周 ${label} ${s.time}`;
   }
   if (s.kind === 'every') return `每 ${s.minutes} 分钟`;
+  if (s.kind === 'window') {
+    return `每天 ${s.start}–${s.end} 随机 ${s.count} 次（分层）`;
+  }
   return JSON.stringify(s);
 }
 
@@ -242,7 +392,7 @@ export class TaskStore {
     // 补齐缺失的 nextRunAt
     for (const t of this.data.tasks) {
       if (!t.nextRunAt) {
-        t.nextRunAt = computeNextRun(t.schedule, Date.now());
+        t.nextRunAt = computeNextRun(t.schedule, Date.now(), { seed: t.id });
         this.dirty = true;
       }
     }
@@ -300,12 +450,12 @@ export class TaskStore {
     }
     if (op.kind === 'run') {
       t.lastRunAt = new Date().toISOString();
-      t.lastResult = op.ok ? 'ok' : String(op.result ?? 'error').slice(0, 200);
+      t.lastResult = op.ok ? String(op.result ?? 'ok') : String(op.result ?? 'error').slice(0, 200);
       if (t.schedule?.kind === 'once') {
         t.enabled = false;
         t.nextRunAt = null;
       } else {
-        t.nextRunAt = computeNextRun(t.schedule, Date.now());
+        t.nextRunAt = computeNextRun(t.schedule, Date.now(), { seed: t.id });
       }
     }
   }
@@ -367,8 +517,9 @@ export class TaskStore {
    * @param {boolean} [input.enabled]
    */
   add(input) {
+    const id = `task-${randomUUID().slice(0, 8)}`;
     const task = {
-      id: `task-${randomUUID().slice(0, 8)}`,
+      id,
       title: input.title ?? input.prompt.slice(0, 20),
       enabled: input.enabled !== false,
       schedule: input.schedule,
@@ -377,7 +528,7 @@ export class TaskStore {
       createdAt: new Date().toISOString(),
       lastRunAt: null,
       lastResult: null,
-      nextRunAt: computeNextRun(input.schedule, Date.now()),
+      nextRunAt: computeNextRun(input.schedule, Date.now(), { seed: id }),
     };
     this.data.tasks.push(task);
     this.ops.push({ kind: 'add', task });
@@ -399,7 +550,7 @@ export class TaskStore {
     if (!t) return false;
     t.enabled = Boolean(enabled);
     if (t.enabled && !t.nextRunAt) {
-      t.nextRunAt = computeNextRun(t.schedule, Date.now());
+      t.nextRunAt = computeNextRun(t.schedule, Date.now(), { seed: t.id });
     }
     this.ops.push({ kind: 'enabled', id, enabled: Boolean(enabled) });
     this.dirty = true;
@@ -418,7 +569,7 @@ export class TaskStore {
   setSchedule(id, schedule, from = Date.now()) {
     const t = this.get(id);
     if (!t) return false;
-    const next = computeNextRun(schedule, from);
+    const next = computeNextRun(schedule, from, { seed: id });
     if (!next) return false;
 
     t.schedule = schedule;
@@ -459,6 +610,25 @@ export class TaskStore {
   }
 
   /**
+   * 跳过窗口任务错过的触发点：直接推进到下一个未来时间点，不执行。
+   * 只对 window schedule 生效。
+   *
+   * @param {string} id
+   * @param {number} [now]
+   * @returns {boolean}
+   */
+  skipMissed(id, now = Date.now()) {
+    const t = this.get(id);
+    if (!t || t.schedule?.kind !== 'window') return false;
+    const next = computeNextRun(t.schedule, now, { seed: t.id });
+    if (!next) return false;
+    t.nextRunAt = next;
+    this.ops.push({ kind: 'schedule', id, schedule: t.schedule, nextRunAt: next });
+    this.dirty = true;
+    return true;
+  }
+
+  /**
    * 找出所有到点的任务。**不执行**，只返回。
    * @param {number} [now]
    * @returns {object[]}
@@ -477,13 +647,13 @@ export class TaskStore {
     const t = this.get(id);
     if (!t) return;
     t.lastRunAt = new Date().toISOString();
-    t.lastResult = ok ? 'ok' : String(result ?? 'error').slice(0, 200);
+    t.lastResult = ok ? String(result ?? 'ok') : String(result ?? 'error').slice(0, 200);
     if (t.schedule?.kind === 'once') {
       t.enabled = false;
       t.nextRunAt = null;
     } else {
-      // 从"现在"推下一次，避免积压时连发
-      const next = computeNextRun(t.schedule, Date.now());
+      // 从"现在"推下一次，避免积压时连发；窗口任务会跳过已经错过的点
+      const next = computeNextRun(t.schedule, Date.now(), { seed: t.id });
       t.nextRunAt = next;
     }
     this.ops.push({ kind: 'run', id, ok, result: t.lastResult });

@@ -8,10 +8,15 @@ import { join } from 'node:path';
 import { tenantRoot } from '../../config.mjs';
 import { requireTenant } from '../tenant-context.mjs';
 import { CLI } from '../context.mjs';
+import { validateWindowSchedule } from '../../tasks/tasks.mjs';
 
-/** 解析 --at / --daily / --weekly / --every，供 add 与 update 共用 */
+/** 解析 --at / --daily / --weekly / --every / --window，供 add 与 update 共用 */
 function parseTaskScheduleArgs(args) {
   let schedule = null;
+  let window = null;
+  let count = null;
+  let spacing = null;
+
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--at') { schedule = { kind: 'once', at: args[++i] }; }
@@ -27,6 +32,28 @@ function parseTaskScheduleArgs(args) {
       }
       schedule = { kind: 'weekly', days: m[1].trim(), time: m[2] };
     }
+    else if (a === '--window') {
+      // 形式: --window "08:00-23:00" --count 10
+      const spec = String(args[++i] ?? '');
+      const m = spec.match(/^(\d{1,2}:\d{2})\s*[-–~]\s*(\d{1,2}:\d{2})$/);
+      if (!m) {
+        console.error('--window 格式: "HH:MM-HH:MM"，例: --window "08:00-23:00" --count 10');
+        process.exit(1);
+      }
+      window = { start: m[1], end: m[2] };
+    }
+    else if (a === '--count') { count = Number(args[++i]); }
+    else if (a === '--spacing') { spacing = args[++i]; }
+  }
+
+  if (window) {
+    schedule = {
+      kind: 'window',
+      start: window.start,
+      end: window.end,
+      count: count ?? 1,
+      spacing: spacing ?? 'stratified',
+    };
   }
   return schedule;
 }
@@ -40,9 +67,10 @@ export async function cmdTask(argv) {
   ${CLI} task <id> add --daily "09:00" --prompt "..."
   ${CLI} task <id> add --weekly "1,3,5 09:00" --prompt "..."   （周一三五）
   ${CLI} task <id> add --every 60 --prompt "..."
+  ${CLI} task <id> add --window "08:00-23:00" --count 10 --prompt "..."
   ${CLI} task <id> rm <taskId|标题>
   ${CLI} task <id> enable|disable <taskId|标题>
-  ${CLI} task <id> update <taskId|标题> --at "..." | --daily "..." | --weekly "..." | --every N
+  ${CLI} task <id> update <taskId|标题> --at "..." | --daily "..." | --weekly "..." | --every N | --window "..." --count N
   ${CLI} task <id> snooze <taskId|标题> [--minutes 10]`);
     process.exit(1);
   }
@@ -95,7 +123,11 @@ export async function cmdTask(argv) {
       if (rest[i] === '--prompt') prompt = rest[++i];
       else if (rest[i] === '--title') title = rest[++i];
     }
-    if (!schedule) { console.error('缺少 --at / --daily / --weekly / --every'); process.exit(1); }
+    if (!schedule) { console.error('缺少 --at / --daily / --weekly / --every / --window'); process.exit(1); }
+    if (schedule.kind === 'window') {
+      const err = validateWindowSchedule(schedule);
+      if (err) { console.error(`窗口参数非法: ${err}`); process.exit(1); }
+    }
     if (!prompt) { console.error('缺少 --prompt'); process.exit(1); }
 
     const t = taskStore.add({ schedule, prompt, title });
@@ -138,7 +170,11 @@ export async function cmdTask(argv) {
       process.exit(1);
     }
     const schedule = parseTaskScheduleArgs(rest.slice(1));
-    if (!schedule) { console.error('缺少 --at / --daily / --weekly / --every'); process.exit(1); }
+    if (!schedule) { console.error('缺少 --at / --daily / --weekly / --every / --window'); process.exit(1); }
+    if (schedule.kind === 'window') {
+      const err = validateWindowSchedule(schedule);
+      if (err) { console.error(`窗口参数非法: ${err}`); process.exit(1); }
+    }
     const task = resolveOrExit(selector);
     if (!taskStore.setSchedule(task.id, schedule)) {
       console.error('时间无法解析，请检查格式');

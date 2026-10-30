@@ -527,6 +527,56 @@ await check('pending 目录不存在时安全返回 0', async () => {
   assert.strictEqual(n, 0);
 });
 
+await check('agent 创建 window 任务：窗口与数量生效', async () => {
+  const store = await freshStore();
+  await writeFile(
+    join(pendingDir, 'win.json'),
+    JSON.stringify({
+      action: 'add',
+      title: '窗口出题',
+      schedule: { kind: 'window', start: '08:00', end: '23:00', count: 10 },
+      prompt: '每次一题',
+    }),
+  );
+  const n = await processPendingTaskRequests({ workspace: ws, store, log });
+  assert.strictEqual(n, 1);
+  const task = store.list().find((t) => t.title === '窗口出题');
+  assert.ok(task, '没有创建任务');
+  assert.strictEqual(task.schedule.kind, 'window');
+  assert.strictEqual(task.schedule.count, 10);
+  assert.ok(task.nextRunAt > Date.now());
+
+  const result = JSON.parse(await readFile(join(ws, '_tasks', 'results', 'win.json'), 'utf8'));
+  assert.strictEqual(result.ok, true);
+  assert.match(result.text, /随机 10 次/);
+});
+
+await check('非法 window 请求被拒绝并说明原因', async () => {
+  const store = await freshStore();
+  const before = store.list().length;
+  await writeFile(
+    join(pendingDir, 'win-bad.json'),
+    JSON.stringify({
+      action: 'add',
+      schedule: { kind: 'window', start: '23:00', end: '08:00', count: 3 },
+      prompt: '非法窗口',
+    }),
+  );
+  const n = await processPendingTaskRequests({ workspace: ws, store, log });
+  assert.strictEqual(n, 1);
+  assert.strictEqual(store.list().length, before);
+  const result = JSON.parse(await readFile(join(ws, '_tasks', 'results', 'win-bad.json'), 'utf8'));
+  assert.strictEqual(result.ok, false);
+  assert.match(result.reason, /start 必须早于 end/);
+});
+
+await check('能力说明包含 window 与 quiz.py 契约', () => {
+  assert.ok(TASK_CAPABILITY_PROMPT.includes('"kind":"window"'));
+  assert.ok(TASK_CAPABILITY_PROMPT.includes('_tools/quiz.py pending'));
+  assert.ok(TASK_CAPABILITY_PROMPT.includes('[[skip]]'));
+  assert.ok(TASK_CAPABILITY_PROMPT.includes('不要主动问下一题'));
+});
+
 await rm(root, { recursive: true, force: true });
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

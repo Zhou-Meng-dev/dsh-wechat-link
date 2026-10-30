@@ -186,6 +186,9 @@ export class Tenant extends EventEmitter {
         // 任务同步等待脚本：agent 写完 pending 请求后，用它等桥接结果再回复
         const { ensureTaskCtl } = await import('./tasks/task-inbox.mjs');
         await ensureTaskCtl(cwd).catch((e) => this.#log(`无法写入 _tools/taskctl.py: ${e.message}`));
+        // 窗口随机任务的进度/计分脚本：agent 用 quiz.py 读写 _quiz/state.json
+        const { ensureQuizTool } = await import('./tasks/quiz.mjs');
+        await ensureQuizTool(cwd).catch((e) => this.#log(`无法写入 _tools/quiz.py: ${e.message}`));
       }
 
       // 1. agent 会话：沙箱/凭据/persona + dsh + 会话映射
