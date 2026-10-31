@@ -270,7 +270,8 @@ export async function uploadMedia({
       aeskey: aeskey.toString('hex'),
     });
   } catch (err) {
-    throw new Error(`获取上传地址失败: ${err.message}`);
+    // 保留 cause：上层要按 status/code 区分「可重试」与「永久失败」
+    throw new Error(`获取上传地址失败: ${err.message}`, { cause: err });
   }
 
   const fullUrl = uploadResp?.upload_full_url?.trim?.();
@@ -311,7 +312,7 @@ export async function uploadMedia({
  * @param {string} [opts.contextToken]
  * @param {{kind: string, params: object}} opts.prepared
  */
-export async function sendPreparedMedia({ ilink, toUserId, contextToken, prepared }) {
+export async function sendPreparedMedia({ ilink, toUserId, contextToken, prepared, clientId }) {
   const p = prepared?.params;
   if (!p?.encryptQueryParam || !p?.aesKeyHex) {
     throw new Error('媒体参数不完整，无法发送');
@@ -324,6 +325,7 @@ export async function sendPreparedMedia({ ilink, toUserId, contextToken, prepare
       encryptQueryParam: p.encryptQueryParam,
       aesKeyHex: p.aesKeyHex,
       ciphertextSize: p.ciphertextSize,
+      clientId,
     });
   }
   if (prepared.kind === 'file') {
@@ -334,6 +336,7 @@ export async function sendPreparedMedia({ ilink, toUserId, contextToken, prepare
       aesKeyHex: p.aesKeyHex,
       fileName: p.fileName,
       plaintextSize: p.plaintextSize,
+      clientId,
     });
   }
   throw new Error(`未知媒体类型: ${prepared.kind}`);
