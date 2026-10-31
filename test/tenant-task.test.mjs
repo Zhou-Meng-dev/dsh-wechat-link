@@ -148,7 +148,119 @@ await check('任务不存在时 runTaskNow 返回 false', async () => {
   assert.strictEqual(await t.runTaskNow('task-nope'), false);
 });
 
-await t.taskRuntime.stop();
+await check('预算 block：跳过任务、不调用 agent、历史 reason=budget', async () => {
+  sent.length = 0;
+  const task = t.taskRuntime.tasks.add({
+    schedule: { kind: 'daily', time: '12:00' },
+    prompt: '出题',
+    title: '预算任务',
+  });
+  await t.taskRuntime.tasks.flush();
+
+  let asks = 0;
+  t.session.ask = async () => { asks += 1; return '不该被调用'; };
+  t.taskRuntime.budgetGuard = {
+    action: 'block',
+    canSpend: () => ({ ok: false, reason: 'tenant-day', scope: 'tenant', window: 'day', spent: 100, limit: 100 }),
+  };
+
+  await t.runTaskNow(task.id);
+  assert.strictEqual(asks, 0, '预算不足时不能调用 agent');
+  assert.strictEqual(sent.length, 1);
+  assert.match(sent[0].text, /预算/);
+  assert.match(sent[0].text, /\/usage/);
+
+  const entry = t.taskRuntime.taskHistory.list().at(-1);
+  assert.strictEqual(entry.result, 'skipped');
+  assert.strictEqual(entry.reason, 'budget');
+  assert.strictEqual(entry.delivery, 'skipped');
+
+  // 同一天第二个任务跳过时不再重复提示（每天一次）
+  sent.length = 0;
+  const task2 = t.taskRuntime.tasks.add({
+    schedule: { kind: 'daily', time: '13:00' },
+    prompt: '出题',
+    title: '预算任务2',
+  });
+  await t.taskRuntime.tasks.flush();
+  await t.runTaskNow(task2.id);
+  assert.strictEqual(asks, 0);
+  assert.strictEqual(sent.length, 0);
+});
+
+await check('预算跳过提示发给 owner（即使任务指向别的 peer）', async () => {
+  sent.length = 0;
+  t.noticeThrottle.reset('user-1', 'task-budget');
+  const task = t.taskRuntime.tasks.add({
+    peerId: 'user-2',
+    schedule: { kind: 'daily', time: '15:00' },
+    prompt: '出题',
+    title: '他人任务',
+  });
+  await t.taskRuntime.tasks.flush();
+
+  let asks = 0;
+  t.session.ask = async () => { asks += 1; return '不该被调用'; };
+  t.taskRuntime.budgetGuard = {
+    action: 'block',
+    canSpend: () => ({ ok: false, reason: 'tenant-day', scope: 'tenant', window: 'day', spent: 1, limit: 1 }),
+  };
+
+  await t.runTaskNow(task.id);
+  assert.strictEqual(asks, 0);
+  assert.strictEqual(sent.length, 1);
+  assert.strictEqual(sent[0].toUserId, 'user-1', '预算提示必须发给 owner');
+  t.taskRuntime.budgetGuard = null;
+});
+
+await check('预算 warn：任务照常执行', async () => {
+  sent.length = 0;
+  const task = t.taskRuntime.tasks.add({
+    schedule: { kind: 'daily', time: '14:00' },
+    prompt: '出题',
+    title: 'warn 任务',
+  });
+  await t.taskRuntime.tasks.flush();
+
+  let asks = 0;
+  t.session.ask = async () => { asks += 1; return '正常回复'; };
+  t.taskRuntime.budgetGuard = {
+    action: 'warn',
+    canSpend: () => ({ ok: false, reason: 'tenant-day', scope: 'tenant', window: 'day', spent: 999, limit: 100 }),
+  };
+
+  await t.runTaskNow(task.id);
+  assert.strictEqual(asks, 1);
+  assert.strictEqual(sent.at(-1).text, '正常回复');
+  t.taskRuntime.budgetGuard = null;
+});
+
+await check('stop() 等在途任务结束（不超过 timeoutMs）', async () => {
+  sent.length = 0;
+  t.taskRuntime.budgetGuard = null;
+  const task = t.taskRuntime.tasks.add({
+    schedule: { kind: 'daily', time: '16:00' },
+    prompt: '出题',
+    title: '慢任务',
+  });
+  await t.taskRuntime.tasks.flush();
+
+  let done = false;
+  t.session.ask = async () => {
+    await new Promise((r) => setTimeout(r, 80));
+    done = true;
+    return '慢回复';
+  };
+
+  const running = t.runTaskNow(task.id);
+  await new Promise((r) => setTimeout(r, 10));
+  await t.taskRuntime.stop({ timeoutMs: 1000 });
+
+  assert.strictEqual(done, true, 'stop 必须等在途任务完成');
+  assert.strictEqual(t.taskRuntime.inflight.size, 0);
+  await running;
+});
+
 await rm(root, { recursive: true, force: true });
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);
