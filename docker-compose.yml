@@ -32,6 +32,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # 必须大于 BRIDGE_SHUTDOWN_TIMEOUT_MS（默认 20s）
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]

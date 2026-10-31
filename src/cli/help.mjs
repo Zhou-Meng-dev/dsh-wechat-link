@@ -65,6 +65,15 @@ DSH × 微信桥接（多租户）
 每个租户 = 一个独立的微信 bot + 独立的 DSH agent + 独立的工作目录，
 互不影响。运行中的服务会自动检测新增/删除的租户。
 
+租户配置（config.json 的 tenants[*]，均可选；不写用默认值）:
+  queueMaxPerPeer        每用户待处理消息上限（默认 20）
+  perUserRatePerMinute   每用户每分钟回合数（默认 20）
+  perUserTurnsPerDay     每用户每日回合上限（默认 0 = 不限）
+  maxConcurrentTurns     每租户并发回合数（默认 4）
+  maxMessageChars        单条消息进入模型的最大字符数（默认 8000）
+  budgetAction           warn | block（默认 warn）
+  perUserBudgetTokensPerDay / perUserBudgetTokensPerMonth  每用户 token 配额（默认不限）
+
 环境变量:
   BRIDGE_HOME          桥接根目录（默认 ~/.dsh-wechat-link；配置/凭据/租户数据都在这里）
   BRIDGE_CONFIG        配置文件路径（默认 $BRIDGE_HOME/config.json）
@@ -80,6 +89,8 @@ DSH × 微信桥接（多租户）
   SANDBOX_HOME         沙箱内要遮蔽的宿主家目录（默认 $HOME）
   BRIDGE_HEALTH_PORT   暴露 /healthz 与 /readyz 的端口（默认不监听）
   BRIDGE_HEALTH_HOST   健康检查绑定地址（默认 127.0.0.1）
+  BRIDGE_SHUTDOWN_TIMEOUT_MS  优雅退出超时（默认 20000；应小于部署 grace period）
+  BRIDGE_DEBUG_INBOUND_IDS    设为 1 时打印首条入站消息字段名（不含内容）
   BRIDGE_OCR_LANG      扫描 PDF OCR 语言（默认自动选 chi_sim+eng）
   DSH_HOME             覆盖 DSH 主目录
 `);

@@ -16,6 +16,7 @@ spec:
       labels:
         app: dsh-wechat-link
     spec:
+      # 必须大于 BRIDGE_SHUTDOWN_TIMEOUT_MS（默认 20s），留 10s 余量
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

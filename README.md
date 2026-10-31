@@ -105,12 +105,33 @@ dsh-wechat-link -h              # 全部命令
 | `config.json` | v2 配置：租户、ownerId、非默认 model/provider/baseUrl |
 | `secrets.json` | bot token、租户 apiKey、defaultApiKey（0600） |
 | `tenants/<id>/` | persona、tasks、会话映射、`dsh-home/` |
+| `tenants/<id>/sync.json` | 入站游标 + 未处理消息 + 最近处理过的消息 id（0600） |
+| `tenants/<id>/outbox.json` | 待发消息（含 `attempts` / `nextAttemptAt` / `clientId`，0600） |
+| `tenants/<id>/dlq.json` | 超过重试次数或永久失败的消息摘要（0600，上限 200 条） |
+| `tenants/<id>/limits.json` | 每用户当日回合计数（0600，跨天重置） |
+| `tenants/<id>/usage.json` | 日/月 token 统计与每用户 token 用量（0600） |
 | `workspace/<id>/` | agent 的工作目录（`_inbox`、`_tasks`、`_tools`、产出文件） |
 
 - 配置版本固定为 `"version": 2`；读到其它版本会直接报错，不会静默改写。
 - 新 bot 登录时继承 `defaultApiKey`（来自 `secrets.json` 或 `BRIDGE_DEFAULT_API_KEY`）；已有租户优先用租户自己的 `apiKey`，没有则回退宿主 DSH 凭据。
 - 默认只有扫码的 `ownerId` 能驱动 bot；`allowUsers` 非空时以名单为准（owner 也要在名单里）。
 - 只读预留字段：`dshHome`、`allowUsers`、`maxChars`、`ackDelayMs`。
+- 输入上限与预算（租户级，均可选；不写用默认值）：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `queueMaxPerPeer` | `20` | 每用户待处理消息上限；超限拒绝最新一条并提示 |
+| `perUserRatePerMinute` | `20` | 每用户每分钟回合数（令牌桶）；超限提示稍后再试 |
+| `perUserTurnsPerDay` | `0` | 每用户每日回合上限；`0` = 不限 |
+| `maxConcurrentTurns` | `4` | 每租户同时执行的回合数；超出排队等待，不拒绝 |
+| `maxMessageChars` | `8000` | 单条消息进入模型的最大字符数；超出截断并在末尾标注原长 |
+| `budgetAction` | `warn` | `warn` 只提醒；`block` 超预算拒绝新回合（含定时任务） |
+| `perUserBudgetTokensPerDay` / `perUserBudgetTokensPerMonth` | 未设置 | 每用户 token 配额；未设置 = 不限 |
+
+  默认值尽量贴近旧行为：单用户低频对话不变；但 `queueMaxPerPeer` / `perUserRatePerMinute` /
+  `maxMessageChars` 对高流量用户是**新增约束**，需要时按上表调大。
+  预算按「租户日 → 租户月 → 用户日 → 用户月」依次检查，用量等于限额也会拦截。
+  `budgetAction: downgrade` 暂不支持（需要在单次调用上覆盖模型，等后续版本）。
 - 常用环境变量：
 
 | 变量 | 作用 |
@@ -121,6 +142,8 @@ dsh-wechat-link -h              # 全部命令
 | `DSH_SANDBOX` | 默认 `1`；`0` 关闭 bwrap（不推荐） |
 | `BRIDGE_DSH_MODE` | `container` 时用容器边界，不套 bwrap |
 | `BRIDGE_HEALTH_PORT` / `BRIDGE_HEALTH_HOST` | 健康检查端口/地址 |
+| `BRIDGE_SHUTDOWN_TIMEOUT_MS` | 优雅退出超时，默认 `20000`；必须小于部署的 grace period |
+| `BRIDGE_DEBUG_INBOUND_IDS` | 设为 `1` 时打印首条入站消息的**字段名**（不含内容），用于确认去重 id 字段 |
 | `BRIDGE_OCR_LANG` | OCR 语言，默认自动选 `chi_sim+eng` |
 
 完整列表见 `node src/main.mjs -h`。
@@ -168,7 +191,7 @@ node src/main.mjs task <id> rm|enable|disable|update|snooze ...
 | 命令 | 作用 |
 |---|---|
 | `/new`（`/reset`、`/重置`、`/清空`） | 开新会话，丢弃上下文 |
-| `/status` | 运行状态、队列、会话、今日用量 |
+| `/status` | 运行状态、队列/待发/重试/放弃、限流计数、会话、今日用量 |
 | `/tasks` | 定时任务列表与下次触发时间 |
 | `/usage` | 今日/本月 token 用量与预算 |
 | `/help` | 帮助 |
@@ -231,6 +254,8 @@ curl http://127.0.0.1:8080/healthz
 
 K8s 模板里 `readinessProbe` 用 `/readyz`，`livenessProbe` 用 `/healthz`。
 
+**优雅退出**：收到 `SIGTERM` / `SIGINT` 后停止轮询、中断在途长轮询、排空已到达的消息与在途回合，刷盘后退出（exit 0）。进程级超时由 `BRIDGE_SHUTDOWN_TIMEOUT_MS` 控制（默认 20s）；超时或收到第二次信号会立即退出（exit 130）。部署模板里的 `terminationGracePeriodSeconds` / `stop_grace_period`（30s）必须大于该值，模板已留 10s 余量。
+
 **Kubernetes**：`deploy/k8s/` 下有 deployment / pvc / secret / login job 模板。
 
 **单文件 SEA**（实验）：
@@ -249,6 +274,11 @@ npm run build:sea
 - DSH 0.2.x 的沙箱主要限制写，不限制读；这是模型工具层的边界，不等于完整安全隔离。
 - OCR / 图表 / 二维码依赖宿主工具；缺失时明确降级，不会自动安装。
 - systemd 部署仅适用于 Linux；macOS 需自行改写为 launchd，且 bwrap 不可用。
+- **入站是「至少一次」**：游标与待处理消息已持久化，崩溃/重启不会静默丢消息；但如果崩溃发生在回复发出后、去重记录写入前，同一个回合可能再执行一次（并再计费一次）。不承诺 exactly-once。
+- **出站重试可能重复送达**：重试复用同一个 `client_id`；若服务端不按它去重，超时类重试可能导致同一条消息送两次。
+- **重试会延迟送达**：可重试错误按指数退避（2s 起、上限 5 分钟），连续 6 次失败或遇到永久错误进入 `dlq.json` 并告警。
+- **预算是软边界**：`budgetAction: block` 在入队前与回合前各检查一次，但并发回合仍可能在检查后继续花额度，最多超出少量在途回合。
+- **热重载不排空**：配置变更触发的租户重启不会等待在途回合；未完成消息留在 `sync.json.pending`，新实例启动后重放。
 
 ## 开发
 

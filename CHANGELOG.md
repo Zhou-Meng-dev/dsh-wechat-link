@@ -3,6 +3,46 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- 入站可靠性：游标、未处理消息与去重环持久化到租户根 `sync.json`（0600）。
+  崩溃/重启后重新入队未完成消息；同一 `message_id` 只处理一次；
+  `sync.json` 损坏时改名留证并从空游标启动。
+- 出站重试：按 token / 可重试 / 永久错误分类；可重试错误原地重试一次后进入待发队列，
+  指数退避（2s 起、上限 5 分钟），第 6 次失败进 `dlq.json`（上限 200 条）。
+- `dlq.json` + owner 告警（5 分钟节流）：放弃的消息不再只留一行日志。
+- 输入上限（租户级，均可选）：`queueMaxPerPeer`、`perUserRatePerMinute`、
+  `perUserTurnsPerDay`、`maxConcurrentTurns`、`maxMessageChars`；`limits.json` 保存当日回合数。
+- 预算硬拦截：`budgetAction`（`warn` / `block`）、
+  `perUserBudgetTokensPerDay` / `perUserBudgetTokensPerMonth`；定时任务同样受约束。
+
+### Changed
+
+- 优雅退出：`SIGTERM` / `SIGINT` 后停止接收、排空在途回合、刷盘并退出；
+  `BRIDGE_SHUTDOWN_TIMEOUT_MS`（默认 20s）控制进程级超时，第二次信号立即退出（exit 130）。
+- `/status` 增加待发/重试/放弃与限流计数。
+- `outbox.json` 升至 v2：新增 `seq` / `clientId` / `attempts` / `nextAttemptAt` / `lastError`；
+  兼容读取 v1，顶层仍是 `peers`，回滚到旧版本仍可读取。
+- `usage.json` 升至 v2：新增 `peers`（每用户日/月 token）；旧文件按空 `peers` 读入。
+- 媒体上传失败改为入队 `media-file`，补发时重新上传并再次经过工作区白名单校验。
+- 默认 `maxConcurrentTurns=4`：多个用户同时提问时最多 4 个并发（单用户串行行为不变）。
+- 默认输入上限（`queueMaxPerPeer=20`、`perUserRatePerMinute=20`、`maxMessageChars=8000`）
+  对高流量用户是新增约束；单用户低频对话行为不变，可按需调大或关闭（`perUserTurnsPerDay=0`）。
+
+### Fixed
+
+- 长轮询在消息落盘前推进游标，进程崩溃会丢消息。
+- 5xx / 超时 / 网络错误只记日志，回复被静默丢弃。
+- 收到 SIGTERM 后 800ms 杀会话、1s 退出，在途回复丢失。
+- 重试无法复用幂等键：`sendmessage` 的 `client_id` 现在随待发消息持久化。
+
+### Known limitations
+
+- 入站语义是「至少一次」：崩溃可能重复执行一次回合（与计费），但不静默丢消息。
+- 出站重试复用 `client_id`；若服务端不按它去重，超时重试可能重复送达。
+
 ## [0.1.1] - 2026-10-31
 
 ### Added
