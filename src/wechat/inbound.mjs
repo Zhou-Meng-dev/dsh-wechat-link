@@ -22,6 +22,8 @@
 import { extractInboundText, formatQuotedContext, isTokenExpiredError } from './ilink.mjs';
 import { UserMessageQueue, DEFAULT_MERGE_WINDOW_MS } from './message-queue.mjs';
 import { parseBuiltinCommand, renderCommand } from './commands.mjs';
+import { dayKey } from '../ops/usage.mjs';
+import { TENANT_LIMITS_DEFAULTS } from '../config.mjs';
 
 export class InboundPipeline {
   /**
@@ -35,11 +37,22 @@ export class InboundPipeline {
    *          flush(force?:boolean):Promise<unknown>}} opts.tokens - context_token 存储
    * @param {object|null} [opts.links]      - LinkIngest（enrich）
    * @param {object|null} [opts.commands]   - 内置命令依赖：usage / getStatus / listTasks
+   * @param {{commitMany(ids: string[]): Promise<unknown>}|null} [opts.journal]
+   *        入站日志。只暴露 commitMany：流水线拿不到游标，也无法推进它
+   * @param {object|null} [opts.limits]     - TenantLimits（truncate / take / allowDay / recordTurn）
+   * @param {object|null} [opts.semaphore]  - Semaphore（全局并发上限）
+   * @param {{canSend(peerId: string, key: string, opts?: object): boolean}|null} [opts.notice]
+   *        提示节流：同一 peer + key 在窗口内只发一次
+   * @param {{action: 'warn'|'block', canSpend(peerId: string): object}|null} [opts.budgetGuard]
+   *        预算守卫：block 且超限时拒绝新回合
+   * @param {() => Date} [opts.now] - 注入时钟（每日配额提示 key 用）
    * @param {(msg: string) => void} [opts.log]
    */
   constructor({
     tenant, ilink, conv, reply, media, tokens,
-    links = null, commands = null, log = () => {},
+    links = null, commands = null, journal = null,
+    limits = null, semaphore = null, notice = null, budgetGuard = null,
+    now = () => new Date(), log = () => {},
   }) {
     this.tenant = tenant;
     this.ilink = ilink;
@@ -49,16 +62,33 @@ export class InboundPipeline {
     this.tokens = tokens;
     this.links = links;
     this.commands = commands;
+    this.journal = journal;
+    this.limits = limits;
+    this.semaphore = semaphore;
+    this.notice = notice;
+    this.budgetGuard = budgetGuard;
+    this.now = now;
     this.log = log;
     /** 每个用户的 typing_ticket 缓存（取不到就每次重试） */
     this.typingTickets = new Map();
+    /** 限流/上限/截断计数（status 直接读这里） */
+    this.counters = { rejected: 0, rateLimited: 0, budgetBlocked: 0, truncated: 0 };
+    /**
+     * 已在队列 / 回合中、但还没 commit 的 journalId。
+     * 作用：dsh 重启后 Tenant 会用 sync.json.pending 重放，而队列本身也是保留的，
+     * 不查重会把同一条消息再跑一遍。提交后从集合里移除。
+     */
+    this.queuedJournalIds = new Set();
 
     /**
      * 同用户消息队列：串行执行 + 500ms 合并。
+     * handle 的第三个参数 items 保留每条的 journalId，回合结束后统一 commit。
      */
     this.queue = new UserMessageQueue({
       windowMs: DEFAULT_MERGE_WINDOW_MS,
-      handle: (peerId, batch) => this.#handleBatch(peerId, batch),
+      // 每用户待处理条数上限（租户配置，默认 20）；拒绝最新一条，不静默丢
+      maxPerPeer: limits?.queueMaxPerPeer ?? tenant.queueMaxPerPeer ?? TENANT_LIMITS_DEFAULTS.queueMaxPerPeer,
+      handle: (peerId, batch, items) => this.#handleBatch(peerId, batch, items),
       log: (m) => this.log(`[queue] ${m}`),
     });
   }
@@ -66,9 +96,21 @@ export class InboundPipeline {
   /**
    * 同步入队：一条原始 WeixinMessage。
    * 访问控制与解析在入队前完成，保证未授权消息不占队列。
+   *
+   * @param {object} msg
+   * @param {{journalId?: string}} [meta] - 入站日志条目 id（回合结束后 commit）
    */
-  push(msg) {
-    this.#handleMessage(msg).catch((e) => this.log(`处理消息失败: ${e.message}`));
+  push(msg, meta = {}) {
+    const journalId = meta?.journalId;
+    if (journalId) {
+      if (this.queuedJournalIds.has(journalId)) return; // 重放/重投递：已经在队列或回合中
+      this.queuedJournalIds.add(journalId);
+    }
+    this.#handleMessage(msg, meta).catch((e) => {
+      this.log(`处理消息失败: ${e.message}`);
+      // 解析阶段抛错也不能把消息永久留在 pending：已给出日志，按已处理收尾
+      this.#commitJournalId(journalId).catch(() => {});
+    });
   }
 
   /** 停止接收并清掉所有待合并定时器（已在跑的回合不会被打断）。 */
@@ -76,9 +118,30 @@ export class InboundPipeline {
     this.queue.stop();
   }
 
-  /** 诊断用：队列里还有多少用户/待处理消息。 */
+  /**
+   * 优雅排空：不再接受新消息，立刻结算合并窗口，等在途回合完成。
+   * 超时返回尚未 commit 的 journalId（保留在 sync.json.pending）。
+   * @param {{timeoutMs?: number}} [opts]
+   */
+  drain(opts = {}) {
+    return this.queue.drain(opts);
+  }
+
+  /** 尚未 commit 的入站消息 id（强制退出诊断用）。 */
+  abandonedIds() {
+    return this.queue.abandonedIds();
+  }
+
+  /** 诊断用：队列 + 限流/上限计数（status 依赖这些字段）。 */
   stats() {
-    return this.queue.stats();
+    return {
+      ...this.queue.stats(),
+      rejected: this.counters.rejected,
+      rateLimited: this.counters.rateLimited,
+      busy: this.semaphore ? this.semaphore.stats().waiting : 0,
+      budgetBlocked: this.counters.budgetBlocked,
+      truncated: this.counters.truncated,
+    };
   }
 
   /**
@@ -98,13 +161,22 @@ export class InboundPipeline {
     return allow.includes(userId);
   }
 
-  async #handleMessage(msg) {
+  async #handleMessage(msg, meta = {}) {
     const from = msg.from_user_id;
-    if (!from) return;
-    if (msg.message_type === 2) return; // bot 自己发的
+    // 在进入队列前就被丢弃的消息，也必须从 pending 里移出：
+    // 它们已经得到确定处理结果（拒绝/忽略），不需要重启后重放。
+    if (!from) {
+      await this.#commitJournalId(meta?.journalId);
+      return;
+    }
+    if (msg.message_type === 2) {
+      await this.#commitJournalId(meta?.journalId); // bot 自己发的
+      return;
+    }
 
     if (!this.#isAllowed(from)) {
       this.log(`拒绝未授权用户: ${from}`);
+      await this.#commitJournalId(meta?.journalId);
       return;
     }
 
@@ -121,7 +193,10 @@ export class InboundPipeline {
     const promptBody = quotedNote ? `${quotedNote}\n\n${text}` : text;
     const allImages = [...(quoted?.images ?? []), ...(rawImages ?? [])];
     const allFiles = [...(quoted?.files ?? []), ...(rawFiles ?? [])];
-    if (!promptBody && allImages.length === 0 && allFiles.length === 0) return;
+    if (!promptBody && allImages.length === 0 && allFiles.length === 0) {
+      await this.#commitJournalId(meta?.journalId);
+      return;
+    }
 
     // 缓存 context_token：每条回复都必须带上它才能送达。
     // 在入队前完成，保证后到的消息也能被定时任务复用。
@@ -141,31 +216,150 @@ export class InboundPipeline {
     // 从而保持「命令前/命令后」的消息顺序。
     // 未知的 /xxx 不拦截，照常交给模型。
     const builtin = parseBuiltinCommand(text);
-    this.queue.push(from, {
+    let queuedText = promptBody;
+
+    // 检查点顺序：长度截断 → 速率 → 每日回合 → 入队上限。
+    // 命令不调模型，不占速率/回合/并发名额。
+    if (!builtin) {
+      const truncated = this.limits?.truncate?.(promptBody);
+      if (truncated?.truncated) {
+        queuedText = truncated.text;
+        this.counters.truncated += 1;
+        this.log(`✂️ [${from.slice(0, 12)}…] 消息过长（${truncated.originalLength} 字），已截断`);
+      }
+
+      const rate = this.limits?.take?.(from);
+      if (rate && rate.ok === false) {
+        this.counters.rateLimited += 1;
+        const seconds = Math.max(1, Math.ceil((rate.retryAfterMs ?? 1000) / 1000));
+        this.#noticeOnce(from, 'rate', `⏳ 消息太频繁了，请 ${seconds} 秒后再试。`, contextToken);
+        await this.#commitJournalId(meta?.journalId);
+        return;
+      }
+
+      const day = this.limits?.allowDay?.(from);
+      if (day && day.ok === false) {
+        this.counters.rejected += 1;
+        this.#noticeOnce(
+          from,
+          `quota-${dayKey(this.now())}`,
+          `📵 今天的回合数已达上限（${day.limit}）。明天再来，或回复 /usage 查看用量。`,
+          contextToken,
+        );
+        await this.#commitJournalId(meta?.journalId);
+        return;
+      }
+
+      // 预算预检（block 模式）：入队前给用户即时反馈；
+      // 回合开始前会再查一次，防止排队期间额度被别的回合花完。
+      const budget = this.#budgetBlocked(from);
+      if (budget) {
+        this.counters.budgetBlocked += 1;
+        this.#noticeOnce(from, 'budget', this.#budgetNotice(budget), contextToken);
+        await this.#commitJournalId(meta?.journalId);
+        return;
+      }
+    }
+
+    const result = this.queue.push(from, {
       kind: builtin ? 'command' : kind,
       command: builtin?.name ?? null,
-      text: promptBody,
+      text: queuedText,
       images: allImages,
       files: allFiles,
       contextToken,
       mergeable: !builtin,
+      journalId: meta?.journalId,
     });
+    if (result?.accepted === false) {
+      if (result.reason === 'draining' || result.reason === 'stopped') {
+        // 关闭中：不能 commit —— 消息必须留在 sync.json.pending，重启后重放
+        if (meta?.journalId) this.queuedJournalIds.delete(meta.journalId);
+        this.log(`队列已停止接收（${result.reason}），消息保留待重启重放`);
+      } else {
+        // 每用户队列满：拒绝最新一条 + 节流提示（用户能立刻感知并重发）
+        this.counters.rejected += 1;
+        this.#noticeOnce(
+          from,
+          result.reason === 'full' ? 'full' : 'rejected',
+          '📥 待处理消息太多，请稍等片刻再发。',
+          contextToken,
+        );
+        await this.#commitJournalId(meta?.journalId);
+      }
+    }
   }
 
   /**
    * 队列回调：同一用户的回合在这里串行执行（不会并发跑两个回合）。
    * batch 可能是多条消息合并后的结果。
+   *
+   * 无论成功、失败、被限流还是被预算拒绝，只要已经给出用户可见结果，
+   * finally 就必须 commit；只有「进程被 kill」这种路径才留下 pending。
    */
-  async #handleBatch(from, batch) {
-    // 用户刚发来新消息 → context_token 已刷新，先把之前积压的消息补发掉
-    await this.reply.flush(from);
+  async #handleBatch(from, batch, items = []) {
+    try {
+      // 用户刚发来新消息 → context_token 已刷新，先把之前积压的消息补发掉
+      await this.reply.flush(from);
 
-    if (batch.kind === 'command') {
-      await this.#handleCommand(from, batch);
+      if (batch.kind === 'command') {
+        // 命令不调模型，不占并发名额
+        await this.#handleCommand(from, batch);
+        return;
+      }
+
+      if (!this.semaphore) {
+        await this.#runTurn(from, batch);
+        return;
+      }
+      // 全局并发上限（每租户）：超出就排队等待，不拒绝
+      const release = await this.semaphore.acquire();
+      try {
+        await this.#runTurn(from, batch);
+      } finally {
+        release?.();
+      }
+    } finally {
+      await this.#commitItems(items);
+    }
+  }
+
+  /** 真正的一次模型回合（已被并发信号量保护）。 */
+  async #runTurn(from, batch) {
+    const { text, images: rawImages, files: rawFiles, contextToken } = batch;
+
+    // 回合前再查一次每日配额：排队期间别的回合可能刚把额度用完
+    if (this.limits?.allowDay) {
+      const day = this.limits.allowDay(from);
+      if (day && day.ok === false) {
+        this.counters.rejected += 1;
+        this.#noticeOnce(
+          from,
+          `quota-${dayKey(this.now())}`,
+          `📵 今天的回合数已达上限（${day.limit}）。明天再来，或回复 /usage 查看用量。`,
+          contextToken,
+        );
+        return;
+      }
+    }
+
+    // 回合前再查一次预算：排队期间别的回合可能刚把额度花完
+    const budget = this.#budgetBlocked(from);
+    if (budget) {
+      this.counters.budgetBlocked += 1;
+      this.#noticeOnce(from, 'budget', this.#budgetNotice(budget), contextToken);
       return;
     }
 
-    const { text, images: rawImages, files: rawFiles, contextToken } = batch;
+    // 回合计数：合并后的多条消息只算一个回合
+    if (this.limits?.recordTurn) {
+      try {
+        await this.limits.recordTurn(from);
+      } catch (err) {
+        this.log(`记录每日回合失败（忽略）: ${err.message}`);
+      }
+    }
+
     try {
       const merged = batch.messageCount > 1 ? ` ×${batch.messageCount}` : '';
       this.log(`📨 [${from.slice(0, 12)}…] (${batch.kind}${merged}) ${text.slice(0, 50)}`);
@@ -220,6 +414,54 @@ export class InboundPipeline {
     }
   }
 
+  /** 提交一批队列条目的 journalId（合并成一次写盘）。 */
+  async #commitItems(items) {
+    const ids = (items ?? []).map((item) => item?.journalId).filter(Boolean);
+    if (ids.length === 0) return;
+    for (const id of ids) this.queuedJournalIds.delete(id);
+    if (!this.journal?.commitMany) return;
+    try {
+      await this.journal.commitMany(ids);
+    } catch (err) {
+      // commit 失败只影响「是否重放一次」，不能反过来打断用户回复
+      this.log(`入站日志 commit 失败（重启后可能重放）: ${err.message}`);
+    }
+  }
+
+  /** 单条消息尚未入队就确定结果时，直接 commit。 */
+  async #commitJournalId(id) {
+    if (!id) return;
+    await this.#commitItems([{ journalId: id }]);
+  }
+
+  /** block 模式下预算不足时返回检查结果；warn 模式永远返回 null。 */
+  #budgetBlocked(peerId) {
+    if (this.budgetGuard?.action !== 'block') return null;
+    const r = this.budgetGuard.canSpend?.(peerId);
+    return r && r.ok === false ? r : null;
+  }
+
+  /** 预算拦截文案：给出今日/本月用量与限额，并引导 /usage。 */
+  #budgetNotice(check) {
+    const label = check.window === 'month' ? '本月' : '今日';
+    const who = check.scope === 'user' ? '你的' : '';
+    return `💸 ${who}${label} token 用量已达 ${check.spent}（限额 ${check.limit}），已暂停新回合。回复 /usage 查看明细。`;
+  }
+
+  /**
+   * 节流提示：同一 peer + key 在窗口内只发一次。
+   * 走 ReplySender（token 失效自然进 outbox），发送失败只记日志。
+   */
+  #noticeOnce(peer, key, text, contextToken) {
+    if (this.notice && typeof this.notice.canSend === 'function' && !this.notice.canSend(peer, key)) {
+      return;
+    }
+    const send = typeof this.reply?.sendText === 'function'
+      ? this.reply.sendText(peer, text, contextToken)
+      : this.reply?.send?.(peer, text, contextToken);
+    Promise.resolve(send).catch((err) => this.log(`提示发送失败（忽略）: ${err.message}`));
+  }
+
   /** 内置命令：不经过模型，直接由桥接处理。 */
   async #handleCommand(from, batch) {
     const name = batch.command ?? parseBuiltinCommand(batch.text)?.name;
@@ -251,9 +493,14 @@ export class InboundPipeline {
     await this.#sendCommandReply(from, text, batch.contextToken);
   }
 
-  /** 命令回复：token 失效时进待发队列，其它错误只记日志。 */
+  /** 命令回复：统一走 ReplySender（分类、重试、入队），失败只记日志。 */
   async #sendCommandReply(from, text, contextToken) {
     try {
+      // reply.sendText 内部已处理 token 失效（入队）与可重试错误（退避/入队）
+      if (typeof this.reply?.sendText === 'function') {
+        await this.reply.sendText(from, text, contextToken);
+        return;
+      }
       await this.ilink.sendText({ toUserId: from, text, contextToken });
     } catch (err) {
       if (isTokenExpiredError(err)) {

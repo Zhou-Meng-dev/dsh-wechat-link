@@ -12,6 +12,9 @@
 import assert from 'node:assert';
 
 import { InboundPipeline } from '../src/wechat/inbound.mjs';
+import { truncateForModel } from '../src/wechat/limits.mjs';
+import { NoticeThrottle } from '../src/wechat/notice-throttle.mjs';
+import { Semaphore } from '../src/wechat/semaphore.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -71,7 +74,7 @@ function makeHarness(tenantOverrides = {}, deps = {}) {
     ...tenantOverrides,
   };
 
-  const conv = {
+  const conv = deps.conv ?? {
     ask: async (peer, text, images) => {
       record.asks.push({ peer, text, images });
       return '回复';
@@ -127,6 +130,10 @@ function makeHarness(tenantOverrides = {}, deps = {}) {
     tokens,
     links: deps.links ?? null,
     commands: deps.commands ?? null,
+    limits: deps.limits ?? null,
+    semaphore: deps.semaphore ?? null,
+    notice: deps.notice ?? null,
+    budgetGuard: deps.budgetGuard ?? null,
     log: (m) => record.logs.push(m),
   });
 
@@ -362,6 +369,143 @@ await check('context_token：入队前缓存，后续消息复用最新值', asy
   await waitFor(() => h.asks.length === 2);
   assert.strictEqual(h.sends[1].ctx, 'ctx-1');
   assert.deepStrictEqual(h.tokenSets, [['owner', 'ctx-1']], '没有新 token 就不应重复写入');
+  h.pipeline.stop();
+});
+
+// ---------------------------------------------------------------- 输入上限
+
+const baseLimits = () => ({
+  queueMaxPerPeer: 20,
+  truncate: (t) => truncateForModel(t, 100_000),
+  take: () => ({ ok: true }),
+  allowDay: () => ({ ok: true, used: 0, limit: 0 }),
+  recordTurn: async () => {},
+});
+
+await check('消息过长：截断后进模型，并在末尾标注原长', async () => {
+  const limits = { ...baseLimits(), truncate: (t) => truncateForModel(t, 10) };
+  const h = makeHarness({}, { limits });
+
+  h.pipeline.push(textMsg('一二三四五六七八九十十一十二', { from: 'owner' }));
+  await waitFor(() => h.asks.length === 1);
+  assert.match(h.asks[0].text, /已截断，原长 14 字/);
+  assert.strictEqual(h.pipeline.stats().truncated, 1);
+  h.pipeline.stop();
+});
+
+await check('每用户速率：超限拒绝 + 节流提示只发一条', async () => {
+  const limits = { ...baseLimits(), take: () => ({ ok: false, retryAfterMs: 3000 }) };
+  const notice = new NoticeThrottle({ windowMs: 60_000, now: () => 0 });
+  const h = makeHarness({}, { limits, notice });
+
+  h.pipeline.push(textMsg('第一条', { from: 'owner', token: 'ctx' }));
+  h.pipeline.push(textMsg('第二条', { from: 'owner', token: 'ctx' }));
+  await waitFor(() => h.sends.length === 1);
+  await sleep(50);
+
+  assert.strictEqual(h.asks.length, 0, '被限流时不能调用模型');
+  assert.strictEqual(h.sends.length, 1, '节流窗口内只提示一次');
+  assert.match(h.sends[0].text, /太频繁/);
+  assert.strictEqual(h.pipeline.stats().rateLimited, 2);
+  h.pipeline.stop();
+});
+
+await check('每日回合上限：拒绝 + 提示（不调用模型）', async () => {
+  const limits = { ...baseLimits(), allowDay: () => ({ ok: false, used: 5, limit: 5 }) };
+  const h = makeHarness({}, { limits, notice: new NoticeThrottle({ now: () => 0 }) });
+
+  h.pipeline.push(textMsg('超配额', { from: 'owner', token: 'ctx' }));
+  await waitFor(() => h.sends.length === 1);
+  assert.strictEqual(h.asks.length, 0);
+  assert.match(h.sends[0].text, /上限（5）/);
+  assert.strictEqual(h.pipeline.stats().rejected, 1);
+  h.pipeline.stop();
+});
+
+await check('每用户队列满：拒绝最新一条 + 提示，不静默丢', async () => {
+  const limits = { ...baseLimits(), queueMaxPerPeer: 1 };
+  const h = makeHarness({}, { limits, notice: new NoticeThrottle({ now: () => 0 }) });
+
+  h.pipeline.push(textMsg('保留', { from: 'owner', token: 'ctx' }));
+  h.pipeline.push(textMsg('被拒', { from: 'owner', token: 'ctx' }));
+
+  await waitFor(() => h.sends.some((s) => /待处理消息太多/.test(s.text)));
+  assert.strictEqual(h.pipeline.stats().rejected, 1);
+  await waitFor(() => h.asks.length === 1);
+  assert.strictEqual(h.asks[0].text, '保留');
+  h.pipeline.stop();
+});
+
+await check('全局并发：超过上限的回合排队等待，不拒绝', async () => {
+  const gate = [];
+  const conv = {
+    ask: (peer) => new Promise((resolve) => {
+      gate.push({ peer, release: () => resolve(`回复:${peer}`) });
+    }),
+    reset: () => {},
+  };
+  const h = makeHarness(
+    { allowUsers: ['owner', 'friend'] },
+    { conv, semaphore: new Semaphore(1) },
+  );
+
+  h.pipeline.push(textMsg('A', { from: 'owner', token: 'ctx' }));
+  h.pipeline.push(textMsg('B', { from: 'friend', token: 'ctx' }));
+
+  await waitFor(() => gate.length === 1, 3000, '第一个回合开始');
+  await sleep(30);
+  assert.strictEqual(gate.length, 1, '并发上限为 1 时第二个回合必须排队');
+  assert.strictEqual(h.pipeline.stats().busy, 1, 'status 应能看到等待数');
+
+  gate[0].release();
+  await waitFor(() => gate.length === 2, 3000, '释放后第二个回合开始');
+  gate[1].release();
+
+  await waitFor(() => h.sends.length >= 2, 3000, '两条回复');
+  assert.deepStrictEqual(h.sends.map((s) => s.text).sort(), ['回复:friend', '回复:owner']);
+  h.pipeline.stop();
+});
+
+await check('内置命令不受限流/配额影响（不调模型）', async () => {
+  const limits = {
+    ...baseLimits(),
+    take: () => ({ ok: false, retryAfterMs: 1000 }),
+    allowDay: () => ({ ok: false, used: 9, limit: 9 }),
+  };
+  const h = makeHarness({}, { limits, notice: new NoticeThrottle({ now: () => 0 }) });
+
+  h.pipeline.push(textMsg('/help', { from: 'owner', token: 'ctx' }));
+  await waitFor(() => h.ilinkTexts.length === 1);
+  assert.strictEqual(h.asks.length, 0);
+  h.pipeline.stop();
+});
+
+await check('预算 block：拒绝新回合 + 提示含 /usage，不调用模型', async () => {
+  const budgetGuard = {
+    action: 'block',
+    canSpend: () => ({ ok: false, reason: 'user-day', scope: 'user', window: 'day', spent: 100, limit: 100 }),
+  };
+  const h = makeHarness({}, { budgetGuard, notice: new NoticeThrottle({ now: () => 0 }) });
+
+  h.pipeline.push(textMsg('还想问', { from: 'owner', token: 'ctx' }));
+  await waitFor(() => h.sends.length === 1);
+  assert.strictEqual(h.asks.length, 0, '预算拦断后不能调用模型');
+  assert.match(h.sends[0].text, /\/usage/);
+  assert.match(h.sends[0].text, /今日|token/);
+  assert.strictEqual(h.pipeline.stats().budgetBlocked, 1);
+  h.pipeline.stop();
+});
+
+await check('预算 warn：只提醒不拦截（保持现状）', async () => {
+  const budgetGuard = {
+    action: 'warn',
+    canSpend: () => ({ ok: false, reason: 'tenant-day', scope: 'tenant', window: 'day', spent: 999, limit: 100 }),
+  };
+  const h = makeHarness({}, { budgetGuard });
+
+  h.pipeline.push(textMsg('照常提问', { from: 'owner', token: 'ctx' }));
+  await waitFor(() => h.asks.length === 1);
+  assert.strictEqual(h.asks[0].text, '照常提问');
   h.pipeline.stop();
 });
 
