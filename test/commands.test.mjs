@@ -65,8 +65,9 @@ await check('formatStatus：状态/会话/队列/任务/用量完整可读', () 
     cwd: '/tmp/ws',
     state: 'running',
     sessions: { peers: 2, sessions: 2, busy: 1 },
-    queue: { peers: 1, pending: 3, running: 1 },
-    outbox: { items: 4, peers: 1 },
+    queue: { peers: 1, pending: 3, running: 1, rejected: 2, rateLimited: 1, budgetBlocked: 1 },
+    outbox: { items: 4, peers: 1, retrying: 2, dlq: 1 },
+    dlq: { items: 1 },
     tasks: { total: 5, enabled: 3 },
     usage: {
       day: { turns: 2, failedTurns: 0, totalTokens: 1234 },
@@ -78,7 +79,8 @@ await check('formatStatus：状态/会话/队列/任务/用量完整可读', () 
   assert.match(text, /状态: 运行中/);
   assert.match(text, /会话: 2 个用户 \/ 1 个忙碌/);
   assert.match(text, /队列: 1 个用户 \/ 3 条待处理/);
-  assert.match(text, /待发: 4 条/);
+  assert.match(text, /待发: 4 条（重试 2，已放弃 1）/);
+  assert.match(text, /限流: 拒绝 2 条（速率 1 \/ 预算 1）/);
   assert.match(text, /定时任务: 5 个（启用 3 个）/);
   assert.match(text, /今日 2 回合 \/ 1,234 tokens/);
   assert.match(text, /本月 9 回合 \/ 5,678 tokens/);
@@ -89,6 +91,7 @@ await check('formatStatus：缺字段时优雅降级', () => {
   assert.match(text, /t-x/);
   assert.match(text, /状态: unknown-state/);
   assert.doesNotMatch(text, /undefined/);
+  assert.doesNotMatch(text, /限流:/, '没有计数时不显示限流行');
 });
 
 await check('formatTasks：空列表给出添加提示', () => {

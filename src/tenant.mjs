@@ -18,9 +18,14 @@ import { IlinkClient } from './wechat/ilink.mjs';
 import { tenantLabel } from './config.mjs';
 import { DEFAULT_MAX_CHARS } from './wechat/split.mjs';
 import { OutboxStore } from './wechat/outbox.mjs';
+import { DlqStore } from './wechat/dlq.mjs';
+import { NoticeThrottle } from './wechat/notice-throttle.mjs';
 import { ReplySender } from './wechat/reply.mjs';
 import { MediaIngest } from './wechat/ingest.mjs';
 import { InboundPipeline } from './wechat/inbound.mjs';
+import { InboundJournal, inboundFieldNames, inboundMessageKey } from './wechat/inbound-journal.mjs';
+import { TenantLimits } from './wechat/limits.mjs';
+import { Semaphore } from './wechat/semaphore.mjs';
 import { LinkIngest } from './wechat/links.mjs';
 import { AgentSession } from './agent/session.mjs';
 import { TaskRuntime } from './tasks/runtime.mjs';
@@ -28,6 +33,8 @@ import { UsageStore } from './ops/usage.mjs';
 
 const STARTUP_RETRY_MS = 3_000;
 const MAX_STARTUP_RETRIES = 5;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Tenant extends EventEmitter {
   /**
@@ -51,10 +58,22 @@ export class Tenant extends EventEmitter {
       budget: {
         day: this.tenant.budgetTokensPerDay,
         month: this.tenant.budgetTokensPerMonth,
+        // 每用户配额；未设置 = 不限
+        userDay: this.tenant.perUserBudgetTokensPerDay,
+        userMonth: this.tenant.perUserBudgetTokensPerMonth,
       },
     });
     // 超过预算时给 owner 发一条提醒（每周期一次；发送失败只记日志）
     this.usage.on('alert', (info) => this.#onBudgetAlert(info));
+
+    /**
+     * 预算守卫：warn = 只提醒；block = 拒绝新回合。
+     * 入站与定时任务共用同一份只读检查。
+     */
+    this.budgetGuard = {
+      action: this.tenant.budgetAction ?? 'warn',
+      canSpend: (peerId) => this.usage.canSpend({ peerId }),
+    };
 
     /** @type {AgentSession} agent 会话：dsh/沙箱/persona/会话映射/token */
     this.session = new AgentSession({
@@ -79,8 +98,20 @@ export class Tenant extends EventEmitter {
       set: (peerId, token) => this.session.setToken(peerId, token),
       flush: (force) => this.session.flushTokens(force),
     };
-    /** @type {OutboxStore|null} token 失效时的待发队列（租户根/outbox.json） */
+    /** @type {OutboxStore|null} token 失效/可重试错误时的待发队列（租户根/outbox.json） */
     this.outbox = null;
+    /** @type {DlqStore|null} 超过尝试次数或被判定永久失败的消息（租户根/dlq.json） */
+    this.dlq = null;
+    /** @type {InboundJournal|null} 入站游标 + 待处理消息 + 去重环（租户根/sync.json） */
+    this.journal = null;
+    /** @type {TenantLimits|null} 每用户速率 / 每日回合 / 消息截断（租户根/limits.json） */
+    this.limits = null;
+    /** @type {Semaphore|null} 全局并发回合上限（每租户） */
+    this.semaphore = null;
+    /** 出站重试定时器（30s，unref） */
+    this.retryTimer = null;
+    /** 提示节流：DLQ 告警、限流提示、预算提示共用 */
+    this.noticeThrottle = new NoticeThrottle();
     /** @type {ReplySender|null} 出站发送（媒体/分段/待发队列），start() 或测试装配点创建 */
     this.reply = null;
     /** @type {InboundPipeline|null} 入站：访问控制/解析/合并/命令，start() 或测试装配点创建 */
@@ -121,6 +152,8 @@ export class Tenant extends EventEmitter {
       maxChars: this.tenant.maxChars ?? DEFAULT_MAX_CHARS,
       ilink: this.ilink,
       outbox: this.outbox,
+      dlq: this.dlq,
+      onDlq: (info) => this.#onDlq(info),
       log: (m) => this.#log(m),
       getContextToken: (peerId) => this.session.getToken(peerId),
     });
@@ -137,6 +170,9 @@ export class Tenant extends EventEmitter {
       reply: this.reply,
       getContextToken: (peerId) => this.session.getToken(peerId),
       isActive: () => this.state === 'running',
+      budgetGuard: this.budgetGuard,
+      // 复用同一个提示节流器：任务预算提示按「每天一次」窗口调用 canSend
+      notice: this.noticeThrottle,
       log: (m) => this.#log(m),
     });
   }
@@ -154,6 +190,14 @@ export class Tenant extends EventEmitter {
       media: this.media,
       tokens: this.tokens,
       links: this.links,
+      // 只把 commitMany 交给流水线：它拿不到游标，也无法推进游标
+      journal: this.journal
+        ? { commitMany: (ids) => this.journal.commitMany(ids) }
+        : null,
+      limits: this.limits,
+      semaphore: this.semaphore,
+      notice: this.noticeThrottle,
+      budgetGuard: this.budgetGuard,
       commands: {
         usage: this.usage,
         getStatus: () => this.status(),
@@ -194,13 +238,35 @@ export class Tenant extends EventEmitter {
       // 1. agent 会话：沙箱/凭据/persona + dsh + 会话映射
       await this.session.start();
 
-      // token 失效时的待发队列：重启后仍保留，用户下次发消息自动补发
+      // 死信队列 + 待发队列：重启后仍保留，用户下次发消息自动补发
       const tenantRoot = this.tenant.root;
-      this.outbox = new OutboxStore(`${tenantRoot}/outbox.json`);
+      this.dlq = new DlqStore(join(tenantRoot, 'dlq.json'));
+      const dlqLoaded = await this.dlq.load();
+      if (dlqLoaded.warning) this.#log(`⚠️ ${dlqLoaded.warning}`);
+      this.outbox = new OutboxStore(join(tenantRoot, 'outbox.json'), { dlq: this.dlq });
       await this.outbox.load();
       const pendingOut = this.outbox.stats();
       if (pendingOut.items > 0) {
         this.#log(`恢复了 ${pendingOut.items} 条待发送消息（${pendingOut.peers} 个用户），等用户下次发消息后补发`);
+      }
+      if (pendingOut.dlq > 0) {
+        this.#log(`待发队列中有 ${pendingOut.dlq} 条已放弃的消息（dlq.json），仅保留摘要`);
+      }
+
+      // 输入上限：每用户速率/每日回合（limits.json）+ 全局并发信号量。
+      // 重启（dsh 退出重拉）时复用已有实例，避免清零当天计数。
+      if (!this.limits) {
+        this.limits = new TenantLimits({
+          path: join(tenantRoot, 'limits.json'),
+          queueMaxPerPeer: this.tenant.queueMaxPerPeer,
+          ratePerMinute: this.tenant.perUserRatePerMinute,
+          turnsPerDay: this.tenant.perUserTurnsPerDay,
+          maxMessageChars: this.tenant.maxMessageChars,
+        });
+        await this.limits.load();
+      }
+      if (!this.semaphore) {
+        this.semaphore = new Semaphore(this.tenant.maxConcurrentTurns);
       }
 
       // 2. iLink 客户端
@@ -217,7 +283,13 @@ export class Tenant extends EventEmitter {
       if (!this.taskRuntime) this.taskRuntime = this.createTaskRuntime();
       await this.taskRuntime.start();
 
-      // 5. 入站流水线：访问控制/解析/队列/命令
+      // 5. 入站日志：游标 + 待处理消息 + 去重环。
+      //    必须在装配流水线之前创建（流水线只拿到 commitMany）。
+      this.journal = new InboundJournal(join(tenantRoot, 'sync.json'));
+      const recovered = await this.journal.load();
+      if (recovered.warning) this.#log(`⚠️ ${recovered.warning}`);
+
+      // 6. 入站流水线：访问控制/解析/队列/命令
       if (!this.inbound) {
         this.inbound = this.createInboundPipeline();
       } else {
@@ -225,10 +297,22 @@ export class Tenant extends EventEmitter {
         this.inbound.rebind({ ilink: this.ilink, conv: this.session, reply: this.reply });
       }
 
+      // 回放必须排在「流水线装配完成」之后、「开始轮询」之前，
+      // 否则会出现「先拉到新消息、后回放旧消息」的顺序错乱。
+      if (recovered.recovered) {
+        this.#log(`恢复 ${recovered.pending.length} 条未处理消息，重新入队`);
+        for (const entry of recovered.pending) {
+          this.inbound.push(entry.msg, { journalId: entry.id });
+        }
+      }
+      // 让长轮询从持久化游标继续；没有游标时保持空串（从头开始）
+      this.ilink.advanceCursor(this.journal.cursor);
+
       this.state = 'running';
       this.startAttempts = 0;
       this.restartExhausted = false;
       if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
+      this.#startRetryTimer();
       this.#log(`✅ 已启动 (cwd=${cwd})`);
       this.emit('running');
 
@@ -266,14 +350,24 @@ export class Tenant extends EventEmitter {
 
   async #pollLoop() {
     let backoff = 1000;
+    let anonSeq = 0;
+    let idProbeLogged = false;
     while (!this.stopped && this.state === 'running') {
+      // pending 满时反压轮询，而不是丢消息：服务端会保留未拉取的消息。
+      if (this.journal?.isFull()) {
+        await sleep(500);
+        continue;
+      }
+
       let resp;
       try {
         resp = await this.ilink.getUpdates();
       } catch (err) {
+        // 关闭中：不要用一个 15s 的退避吃掉整个关闭预算
+        if (this.state !== 'running') break;
         // 长轮询超时属正常
         backoff = Math.min(backoff * 2, 15_000);
-        await new Promise((r) => setTimeout(r, Math.min(backoff, 15_000)));
+        await sleep(backoff);
         continue;
       }
       backoff = 1000;
@@ -286,9 +380,102 @@ export class Tenant extends EventEmitter {
         return;
       }
 
-      for (const msg of resp.msgs ?? []) {
-        this.inbound.push(msg);
+      const msgs = Array.isArray(resp.msgs) ? resp.msgs : [];
+      // 诊断：确认去重 id 的字段名（只打印字段名，不打内容），每条连接一次
+      if (!idProbeLogged && msgs.length > 0 && process.env.BRIDGE_DEBUG_INBOUND_IDS === '1') {
+        idProbeLogged = true;
+        this.#log(`🔍 入站消息字段名（诊断用）: ${inboundFieldNames(msgs[0]).join(', ')}`);
       }
+      if (!this.journal) {
+        // 理论上 start() 一定会装配 journal；退化路径保持旧行为，不阻塞收消息
+        this.ilink.advanceCursor(resp.get_updates_buf);
+        for (const msg of msgs) this.inbound.push(msg);
+        continue;
+      }
+
+      if (msgs.length === 0
+        && (!resp.get_updates_buf || resp.get_updates_buf === this.journal.cursor)) {
+        continue;
+      }
+
+      const entries = [];
+      let anon = 0;
+      for (const msg of msgs) {
+        const key = inboundMessageKey(msg);
+        let id = key.id;
+        if (!id) {
+          anonSeq += 1;
+          id = `anon-${Date.now().toString(36)}-${anonSeq}`;
+          anon += 1;
+        }
+        entries.push({ id, msg, weak: key.strength === 'weak' });
+      }
+      if (anon > 0) {
+        this.#log(`⚠️ ${anon} 条消息缺少可用 id，无法可靠去重（已按一次性 id 处理）`);
+      }
+
+      let admitted;
+      try {
+        // 先落盘游标 + 待处理消息；这一步成功之前游标绝不前进
+        admitted = await this.journal.admit(resp.get_updates_buf, entries);
+      } catch (err) {
+        if (this.state !== 'running') break;
+        // 写盘失败（磁盘满等）：内存游标不前进，退避后重试同一批
+        backoff = Math.min(backoff * 2, 15_000);
+        this.#log(`❌ 入站日志写盘失败（游标未推进，${backoff}ms 后重试）: ${err.message}`);
+        await sleep(backoff);
+        continue;
+      }
+
+      this.ilink.advanceCursor(resp.get_updates_buf);
+      for (const entry of admitted.accepted) {
+        this.inbound.push(entry.msg, { journalId: entry.id });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- 出站重试
+
+  #startRetryTimer() {
+    if (this.retryTimer) return;
+    this.retryTimer = setInterval(() => {
+      this.#retryTick().catch((err) => this.#log(`出站重试失败: ${err.message}`));
+    }, 30_000);
+    // 不阻止进程退出：服务由长轮询/健康端口保活
+    this.retryTimer.unref?.();
+  }
+
+  /** 每 30s 对「队首已到重试时间且该 peer 有 token」的队列补发一次。 */
+  async #retryTick() {
+    if (this.state !== 'running' || !this.outbox || !this.reply) return;
+    const now = Date.now();
+    for (const peerId of [...this.outbox.peers.keys()]) {
+      if (this.state !== 'running') return;
+      if (!this.outbox.dueHead(peerId, now)) continue;
+      // 没有 context_token 时不消耗尝试次数：等用户下次入站拿到新 token
+      if (!this.session?.getToken?.(peerId)) continue;
+      await this.reply
+        .flush(peerId)
+        .catch((err) => this.#log(`补发 ${peerId.slice(0, 12)}… 失败: ${err.message}`));
+    }
+  }
+
+  /** 一条消息被放弃：刷 DLQ、按节流给 owner 发一条汇总。 */
+  async #onDlq({ peerId, reason, attempts }) {
+    this.#log(`⚠️ [${peerId.slice(0, 12)}…] 消息进入 DLQ: ${String(reason ?? '').slice(0, 100)}`);
+    await this.dlq?.flush().catch(() => {});
+
+    const owner = this.tenant.ownerId;
+    if (!owner) return;
+    if (!this.noticeThrottle.canSend(owner, 'dlq')) return;
+
+    const token = this.session?.getToken?.(owner);
+    const text = `⚠️ 有消息发送失败已被放弃${attempts ? `（尝试 ${attempts} 次）` : ''}。回复 /status 查看待发队列。`;
+    try {
+      // 直接走 ilink：告警自身失败只记日志，绝不再入队（防止循环）
+      await this.ilink?.sendText?.({ toUserId: owner, text, contextToken: token });
+    } catch (err) {
+      this.#log(`DLQ 告警发送失败（忽略，不再入队）: ${err.message}`);
     }
   }
 
@@ -300,20 +487,87 @@ export class Tenant extends EventEmitter {
     return this.taskRuntime.runNow(taskId);
   }
 
-  async stop() {
+  /**
+   * 停止本租户。
+   *
+   * 顺序：
+   *   1. 停止轮询 + 中断在途长轮询（游标未推进，消息会被重投）
+   *   2. 排空入站队列：不再接新消息、立刻结算合并窗口、等在途回合
+   *   3. 等会话里的回合结束（正常情况下第 2 步已空闲）
+   *   4. 停任务调度器
+   *   5. 刷盘 journal → outbox → dlq → usage → tokens
+   *   6. notifyStop → 关闭 dsh
+   *
+   * @param {object} [opts]
+   * @param {boolean} [opts.drain=true] - 热重载可传 false：不排空，消息留在 sync.json.pending
+   * @param {number} [opts.timeoutMs=20000]
+   */
+  async stop({ drain = true, timeoutMs = 20_000 } = {}) {
     if (this.stopped) return;
     this.stopped = true;
-    this.state = 'stopped';
-    this.#log('正在停止…');
-    // 停止队列（清掉待合并定时器）与任务调度器，并刷盘任务/历史
-    this.inbound?.stop();
-    await this.taskRuntime?.stop().catch(() => {});
+    this.state = 'stopping';
+    if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
+
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    const remaining = () => Math.max(0, deadline - Date.now());
+    this.#log(drain ? `正在优雅停止（最多 ${Math.max(0, Number(timeoutMs) || 0)}ms）…` : '正在停止（不排空）…');
+
+    // 1. 停止轮询：中断在途长轮询，避免等满 35s
+    try { this.ilink?.abort?.(); } catch { /* 已关闭 */ }
+
+    // 2. 排空入站队列
+    if (drain && typeof this.inbound?.drain === 'function') {
+      const r = await this.inbound
+        .drain({ timeoutMs: remaining() })
+        .catch((err) => {
+          this.#log(`排空入站队列失败: ${err.message}`);
+          return { idle: false, abandoned: [] };
+        });
+      const abandoned = Array.isArray(r?.abandoned) ? r.abandoned : [];
+      if (abandoned.length > 0) {
+        const preview = abandoned.slice(0, 5).map((id) => String(id).slice(0, 12)).join(', ');
+        this.#log(`⚠️ 关闭超时：${abandoned.length} 条消息未完成（${preview}），已保留在 sync.json.pending，重启后重放`);
+      }
+      // 3. 等会话回合（排空已覆盖；这里兜底「回合在队列摘除后仍在跑」的窗口）
+      const idle = await this.session
+        ?.waitIdle?.({ timeoutMs: remaining() })
+        .catch(() => null);
+      if (idle && idle.idle === false) {
+        this.#log(`⚠️ 关闭超时：仍有 ${idle.busy ?? '?'} 个回合并未结束，回复可能进入 outbox`);
+      }
+      // 队列状态清掉，但未 commit 的消息仍在 sync.json.pending
+      this.inbound.stop();
+    } else {
+      // 热重载：在途消息仍在 sync.json.pending，新 Tenant 启动后会重放
+      this.inbound?.stop();
+    }
+
+    // 4. 停任务调度器（不再触发新任务；在途任务等到同一截止时间）
+    await this.taskRuntime?.stop({ timeoutMs: remaining() }).catch(() => {});
+
+    // 5. 刷盘：顺序与数据依赖一致
+    await this.journal?.flush().catch(() => {});
     await this.outbox?.flush().catch(() => {});
+    await this.dlq?.flush().catch(() => {});
+    await this.limits?.flush().catch(() => {});
     await this.usage.flush().catch(() => {});
-    // 先把会话映射刷盘，避免重启丢上下文；再通知服务端、关闭 dsh
     await this.session.flushTokens(true).catch(() => {});
+
+    // 6. 通知服务端、关闭 dsh
     await this.ilink?.notifyStop().catch(() => {});
     await this.session.stop().catch(() => {});
+
+    this.state = 'stopped';
+    this.#log('已停止');
+    this.emit('stopped');
+  }
+
+  /**
+   * 尚未 commit 的入站消息 id（强制退出前记录放弃项）。
+   * @returns {string[]}
+   */
+  abandonedIds() {
+    return this.inbound?.abandonedIds?.() ?? [];
   }
 
   status() {
@@ -326,7 +580,10 @@ export class Tenant extends EventEmitter {
       state: this.state,
       sessions: this.session ? this.session.stats() : null,
       queue: this.inbound ? this.inbound.stats() : { peers: 0, pending: 0, running: 0 },
+      journal: this.journal ? this.journal.stats() : null,
       outbox: this.outbox ? this.outbox.stats() : null,
+      dlq: this.dlq ? this.dlq.stats() : null,
+      limits: this.limits ? this.limits.stats() : null,
       tasks: tasks
         ? { total: tasks.length, enabled: tasks.filter((t) => t.enabled).length }
         : { total: 0, enabled: 0 },

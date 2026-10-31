@@ -95,7 +95,20 @@ export function formatStatus(status = {}) {
     lines.push(`队列: ${status.queue.peers ?? 0} 个用户 / ${status.queue.pending ?? 0} 条待处理`);
   }
   if (status.outbox) {
-    lines.push(`待发: ${status.outbox.items ?? 0} 条（token 失效时暂存）`);
+    // 待发 + 重试 + 放弃，排障时不用翻日志也能看出队列健康度
+    const retrying = status.outbox.retrying ?? 0;
+    const dlq = status.outbox.dlq ?? status.dlq?.items ?? 0;
+    const extra = retrying + dlq > 0 ? `（重试 ${retrying}，已放弃 ${dlq}）` : '';
+    lines.push(`待发: ${status.outbox.items ?? 0} 条${extra}`);
+  }
+  if (status.queue) {
+    // 限流/拒绝计数只在非零时显示，避免 /status 变长
+    const rejected = status.queue.rejected ?? 0;
+    const rateLimited = status.queue.rateLimited ?? 0;
+    const budgetBlocked = status.queue.budgetBlocked ?? 0;
+    if (rejected + rateLimited + budgetBlocked > 0) {
+      lines.push(`限流: 拒绝 ${rejected} 条（速率 ${rateLimited} / 预算 ${budgetBlocked}）`);
+    }
   }
   if (status.tasks) {
     lines.push(`定时任务: ${status.tasks.total ?? 0} 个（启用 ${status.tasks.enabled ?? 0} 个）`);
