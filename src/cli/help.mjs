@@ -90,6 +90,7 @@ DSH × 微信桥接（多租户）
   BRIDGE_HEALTH_PORT   暴露 /healthz 与 /readyz 的端口（默认不监听）
   BRIDGE_HEALTH_HOST   健康检查绑定地址（默认 127.0.0.1）
   BRIDGE_SHUTDOWN_TIMEOUT_MS  优雅退出超时（默认 20000；应小于部署 grace period）
+  BRIDGE_SANDBOX_ENV_PASSTHROUGH  逗号分隔的额外透传变量名（沙箱默认清空环境变量）
   BRIDGE_DEBUG_INBOUND_IDS    设为 1 时打印首条入站消息字段名（不含内容）
   BRIDGE_OCR_LANG      扫描 PDF OCR 语言（默认自动选 chi_sim+eng）
   DSH_HOME             覆盖 DSH 主目录

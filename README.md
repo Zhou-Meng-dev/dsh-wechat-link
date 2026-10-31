@@ -143,6 +143,7 @@ dsh-wechat-link -h              # 全部命令
 | `BRIDGE_DSH_MODE` | `container` 时用容器边界，不套 bwrap |
 | `BRIDGE_HEALTH_PORT` / `BRIDGE_HEALTH_HOST` | 健康检查端口/地址 |
 | `BRIDGE_SHUTDOWN_TIMEOUT_MS` | 优雅退出超时，默认 `20000`；必须小于部署的 grace period |
+| `BRIDGE_SANDBOX_ENV_PASSTHROUGH` | 逗号分隔的额外环境变量名；沙箱内默认清空环境变量，只透传白名单与租户 key，慎用 |
 | `BRIDGE_DEBUG_INBOUND_IDS` | 设为 `1` 时打印首条入站消息的**字段名**（不含内容），用于确认去重 id 字段 |
 | `BRIDGE_OCR_LANG` | OCR 语言，默认自动选 `chi_sim+eng` |
 
@@ -211,6 +212,7 @@ node src/main.mjs task <id> rm|enable|disable|update|snooze ...
 
 - 宿主家目录被 tmpfs 遮住，只露出本租户的 `dsh-home` 和工作区；
 - 凭据文件只读挂载；租户 API key 通过进程环境注入（没有独立 key 时回退宿主凭据）；
+- **沙箱内环境变量默认清空**（bwrap `--clearenv`），只显式设置 `HOME`/`DSH_HOME`/`PATH` 等必需项、`TZ`/`LANG`/代理/CA 等白名单，以及本租户 API key；宿主 `BRIDGE_*`、`CRED_SOURCE`、宿主 `DEEPSEEK_API_KEY` 不会被继承；确实需要额外变量时用 `BRIDGE_SANDBOX_ENV_PASSTHROUGH` 显式列出（会暴露给 agent，谨慎）；
 - 看不到桥接的 `~/.dsh-wechat-link`（含 bot token / secrets）；
 - 写入限制在本租户的工作区和 dsh-home；读取系统库和网络不受限（模型调用、CDN 上传需要）。
 
@@ -271,7 +273,7 @@ npm run build:sea
 - 审批卡转发未实现；需要审批的工具调用会超时失败。
 - 视频按普通文件收发，没有微信视频气泡。
 - 微信单条消息有长度上限；超长回复会自动分段，更大的内容转文件发送。
-- DSH 0.2.x 的沙箱主要限制写，不限制读；这是模型工具层的边界，不等于完整安全隔离。
+- DSH 0.2.x 的沙箱主要限制写，不限制读（只读挂载内的文件仍可读）；环境变量默认已清空，但可见文件内容与网络仍是残余风险，不等于完整安全隔离。
 - OCR / 图表 / 二维码依赖宿主工具；缺失时明确降级，不会自动安装。
 - systemd 部署仅适用于 Linux；macOS 需自行改写为 launchd，且 bwrap 不可用。
 - **入站是「至少一次」**：游标与待处理消息已持久化，崩溃/重启不会静默丢消息；但如果崩溃发生在回复发出后、去重记录写入前，同一个回合可能再执行一次（并再计费一次）。不承诺 exactly-once。

@@ -52,7 +52,7 @@ export class DshClient extends EventEmitter {
   async start() {
     if (this.proc) throw new Error('客户端已启动');
 
-    const env = { ...process.env, ...(this.opts.extraEnv ?? {}) };
+    let env = { ...process.env, ...(this.opts.extraEnv ?? {}) };
     if (this.opts.dshHome) env.DSH_HOME = this.opts.dshHome;
 
     // 启动命令优先级：
@@ -63,14 +63,17 @@ export class DshClient extends EventEmitter {
     let argv;
     let spawnCwd = this.opts.cwd;
     if (this.opts.sandboxOpts) {
-      const { buildSandboxArgv } = await import('../sandbox/sandbox.mjs');
+      const { buildSandboxArgv, sandboxEnvFrom } = await import('../sandbox/sandbox.mjs');
       const dshArgs = ['--profile', this.opts.profile, ...(this.opts.extraDshArgs ?? [])];
       argv = buildSandboxArgv({
         ...this.opts.sandboxOpts,
         dshArgs,
-        envVars: this.opts.extraEnv ?? {},
+        // 只把白名单变量与租户 key 显式 --setenv 进去；bwrap 会 --clearenv
+        envVars: sandboxEnvFrom(process.env, this.opts.extraEnv ?? {}),
       });
       cmd = process.env.BWRAP_BIN ?? '/usr/bin/bwrap';
+      // bwrap 自身不需要宿主环境；agent 的环境完全由上面的 --setenv 决定
+      env = {};
     } else if (this.opts.dshCmd) {
       const [c, ...pre] = this.opts.dshCmd;
       cmd = c;

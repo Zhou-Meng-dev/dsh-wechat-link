@@ -39,6 +39,7 @@
 - 重试无法复用幂等键：`sendmessage` 的 `client_id` 现在随待发消息持久化。
 - 有待发积压时，新回复/提示会排在积压之后，不会越过退避中的旧消息；同一用户的并发补发只执行一次。
 - 用量统计定时落盘，dsh 重启不再丢弃未落盘的 token 计数。
+- 沙箱内默认清空宿主环境变量，只透传白名单与租户 API key；新增 `BRIDGE_SANDBOX_ENV_PASSTHROUGH` 显式放宽。
 
 ### Known limitations
 

@@ -19,6 +19,80 @@ import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 /**
+ * 允许透传进沙箱的宿主环境变量：只包含运行/网络/编码必需、且不含凭据的项。
+ * 其它变量（BRIDGE_*、CRED_SOURCE、宿主 DEEPSEEK_API_KEY 等）默认全部丢弃。
+ */
+export const SANDBOX_ENV_PASSTHROUGH = Object.freeze([
+  'TZ',
+  'LANG',
+  'LANGUAGE',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LC_MESSAGES',
+  'LC_NUMERIC',
+  'LC_TIME',
+  'TERM',
+  'COLORTERM',
+  'NO_COLOR',
+  'FORCE_COLOR',
+  'CLICOLOR',
+  'CLICOLOR_FORCE',
+  'SHELL',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NODE_EXTRA_CA_CERTS',
+  // 非凭据的 dsh 运行偏好
+  'DEEPSEEK_BASE_URL',
+  'DSH_TELEMETRY_DISABLED',
+  'DSH_WEB_FETCH_PROVIDER',
+  'DSH_WEB_SEARCH_PROVIDER',
+  'DSH_BUNDLED_SKILL_DIR',
+]);
+
+/** 由 bwrap 固定设置、不允许被透传或 extra 覆盖的变量 */
+const RESERVED_ENV = new Set(['HOME', 'DSH_HOME', 'DSH_IN_CONTAINER', 'PATH', 'PWD', 'TMPDIR']);
+
+/** 允许通过 BRIDGE_SANDBOX_ENV_PASSTHROUGH 额外透传的变量名 */
+function extraPassthroughNames(hostEnv) {
+  return String(hostEnv?.BRIDGE_SANDBOX_ENV_PASSTHROUGH ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((name) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name));
+}
+
+/**
+ * 计算沙箱内要显式设置的环境变量。
+ *
+ * - 默认只取 SANDBOX_ENV_PASSTHROUGH，宿主其它变量（含密钥）全部丢弃
+ * - `extra`（租户 API key）优先覆盖同名宿主变量
+ * - BRIDGE_SANDBOX_ENV_PASSTHROUGH 可追加变量名，但保留变量始终由 bwrap 固定
+ *
+ * @param {NodeJS.ProcessEnv} [hostEnv]
+ * @param {Record<string, string>} [extra]
+ * @returns {Record<string, string>}
+ */
+export function sandboxEnvFrom(hostEnv = process.env, extra = {}) {
+  const names = new Set([...SANDBOX_ENV_PASSTHROUGH, ...extraPassthroughNames(hostEnv)]);
+  const out = {};
+  for (const name of names) {
+    if (RESERVED_ENV.has(name)) continue;
+    const value = hostEnv?.[name];
+    if (value !== undefined) out[name] = String(value);
+  }
+  for (const [name, value] of Object.entries(extra ?? {})) {
+    if (RESERVED_ENV.has(name) || value === undefined) continue;
+    out[name] = String(value);
+  }
+  return out;
+}
+
+/**
  * @param {object} opts
  * @param {string} opts.cwd       - 租户工作目录（宿主机绝对路径）
  * @param {string} opts.dshHome   - 租户独立 DSH_HOME（宿主机绝对路径）
@@ -79,13 +153,20 @@ export function buildSandboxArgv(opts) {
     '--die-with-parent',
     '--new-session',
     '--chdir', cwd,
+    // 先清空宿主环境，再只设置白名单/租户变量；否则 agent 能通过 env 读到
+    // BRIDGE_* / CRED_SOURCE / 宿主 DEEPSEEK_API_KEY 等。
+    '--clearenv',
     '--setenv', 'HOME', homeDir,
     '--setenv', 'DSH_HOME', `${homeDir}/.dsh`,
     '--setenv', 'DSH_IN_CONTAINER', '1',
     '--setenv', 'PATH', `${dirname(nodeBin)}:/usr/local/bin:/usr/bin:/bin`,
+    '--setenv', 'PWD', cwd,
+    '--setenv', 'TMPDIR', '/tmp',
     // 额外环境变量（如租户自己的 DEEPSEEK_API_KEY）。
     // 用 --setenv 注入，不落盘到任何文件，agent 只能通过自己的环境读到本租户的 key。
-    ...Object.entries(opts.envVars ?? {}).flatMap(([k, v]) => ['--setenv', k, String(v)]),
+    ...Object.entries(opts.envVars ?? {})
+      .filter(([k]) => !RESERVED_ENV.has(k))
+      .flatMap(([k, v]) => ['--setenv', k, String(v)]),
     nodeBin, dshJs, ...dshArgs,
   );
   return args;

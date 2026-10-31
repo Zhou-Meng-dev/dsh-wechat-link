@@ -33,6 +33,7 @@
 
 - 每租户独立 `dsh` 子进程、独立 `DSH_HOME`、独立工作目录与会话。
 - **默认**用 bubblewrap 遮蔽宿主家目录，只暴露租户目录与只读工具链；`DSH_SANDBOX=0` 才会关闭（启动会告警）。
+- bwrap 内默认 `--clearenv`，只显式设置 `HOME`/`DSH_HOME`/`PATH` 等必需项、`TZ`/`LANG`/代理/CA 等白名单与租户 API key；宿主 `BRIDGE_*`、`CRED_SOURCE`、宿主 `DEEPSEEK_API_KEY` 不继承。确需额外变量时用 `BRIDGE_SANDBOX_ENV_PASSTHROUGH` 显式列出。
 - 容器模式下容器本身即隔离边界，不再套 bwrap。
 - `allowUsers` 白名单；留空时只有扫码 owner 能驱动 bot。
 - 配置 / 凭据目录 0700、文件 0600；密钥可通过环境变量注入，不强制落盘。

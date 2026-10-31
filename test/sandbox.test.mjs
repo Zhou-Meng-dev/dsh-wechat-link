@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildSandboxArgv } from '../src/sandbox/sandbox.mjs';
+import { buildSandboxArgv, sandboxEnvFrom } from '../src/sandbox/sandbox.mjs';
 
 function baseOpts() {
   return {
@@ -65,4 +65,55 @@ test('先遮住家目录，再 bind dsh-home 与工作目录', () => {
 
   assert.ok(tmpfsHome >= 0 && bindHome >= 0);
   assert.ok(tmpfsHome < bindHome, '家目录 tmpfs 必须先于 dsh-home bind');
+});
+
+test('沙箱内先 --clearenv，再只设置固定变量与显式 envVars', () => {
+  const argv = buildSandboxArgv({
+    ...baseOpts(),
+    envVars: { TZ: 'Asia/Hong_Kong', DEEPSEEK_API_KEY: 'tenant-key' },
+  });
+
+  const clear = argv.indexOf('--clearenv');
+  const firstSet = argv.indexOf('--setenv');
+  assert.ok(clear >= 0, '必须包含 --clearenv');
+  assert.ok(clear < firstSet, '--clearenv 必须早于 --setenv');
+
+  const keys = [];
+  for (let i = 0; i < argv.length - 2; i += 1) {
+    if (argv[i] === '--setenv') keys.push(argv[i + 1]);
+  }
+  assert.deepStrictEqual(
+    keys.sort(),
+    ['DEEPSEEK_API_KEY', 'DSH_HOME', 'DSH_IN_CONTAINER', 'HOME', 'PATH', 'PWD', 'TMPDIR', 'TZ'].sort(),
+  );
+});
+
+test('sandboxEnvFrom：宿主密钥不继承，租户 key 覆盖同名变量', () => {
+  const env = {
+    TZ: 'Asia/Hong_Kong',
+    LANG: 'C.UTF-8',
+    BRIDGE_DEFAULT_API_KEY: 'host-secret',
+    CRED_SOURCE: '/home/test/.dsh/.credentials.yaml',
+    DEEPSEEK_API_KEY: 'host-key',
+  };
+  const out = sandboxEnvFrom(env, { DEEPSEEK_API_KEY: 'tenant-key' });
+
+  assert.strictEqual(out.TZ, 'Asia/Hong_Kong');
+  assert.strictEqual(out.LANG, 'C.UTF-8');
+  assert.strictEqual(out.DEEPSEEK_API_KEY, 'tenant-key');
+  assert.strictEqual('BRIDGE_DEFAULT_API_KEY' in out, false);
+  assert.strictEqual('CRED_SOURCE' in out, false);
+});
+
+test('sandboxEnvFrom：显式透传生效，但 HOME/DSH_HOME 等保留变量不可覆盖', () => {
+  const out = sandboxEnvFrom({
+    MY_EXTRA: 'x',
+    HOME: '/home/test',
+    DSH_HOME: '/tmp/evil',
+    BRIDGE_SANDBOX_ENV_PASSTHROUGH: 'MY_EXTRA,HOME,DSH_HOME',
+  });
+
+  assert.strictEqual(out.MY_EXTRA, 'x');
+  assert.strictEqual('HOME' in out, false);
+  assert.strictEqual('DSH_HOME' in out, false);
 });
