@@ -5,9 +5,12 @@
  * 由 ConversationManager 在每个回合结束后回调；一次回合可能有多条
  * assistant/message（工具调用循环），这里全部累加。
  *
- * 存储：租户根目录 `usage.json`（0600），按**本地日期**分桶：
+ * 存储：租户根目录 `usage.json`（0600），按**本地日期**分桶；
+ * v2 增加每用户 token（用于每用户配额）：
  * {
- *   "version": 1,
+ *   "version": 2,
+ *   "peers": { "<peerId>": { "day": "2026-10-31", "dayTokens": 1200,
+ *                            "month": "2026-10", "monthTokens": 8000, "lastAt": 1761000000000 } },
  *   "days": {
  *     "2026-10-30": {
  *       "turns": 3, "failedTurns": 0,
@@ -29,9 +32,11 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-const VERSION = 1;
+const VERSION = 2;
 /** 明细按天保留多少天；月汇总由天桶推导，120 天足够覆盖当前月与上季度。 */
 const DEFAULT_RETENTION_DAYS = 120;
+/** 每用户桶上限：超出按 lastAt 淘汰最旧（租户根文件不能无限增长）。 */
+export const DEFAULT_MAX_USAGE_PEERS = 2000;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
@@ -99,7 +104,7 @@ export function formatTokens(n) {
 
 /** 解析 usage.json；结构不对时按空数据 --- 统计损坏不该阻塞服务。 */
 function parseData(raw) {
-  const data = { version: VERSION, days: {}, alerts: {} };
+  const data = { version: VERSION, days: {}, alerts: {}, peers: {} };
   if (!raw || typeof raw !== 'object') return data;
   if (raw.days && typeof raw.days === 'object') {
     for (const [key, value] of Object.entries(raw.days)) {
@@ -117,6 +122,19 @@ function parseData(raw) {
         }
       }
       data.days[key] = bucket;
+    }
+  }
+  if (raw.peers && typeof raw.peers === 'object') {
+    for (const [peerId, value] of Object.entries(raw.peers)) {
+      if (!peerId || !value || typeof value !== 'object') continue;
+      const peer = {
+        day: typeof value.day === 'string' ? value.day : '',
+        dayTokens: Math.max(0, Number(value.dayTokens) || 0),
+        month: typeof value.month === 'string' ? value.month : '',
+        monthTokens: Math.max(0, Number(value.monthTokens) || 0),
+        lastAt: Math.max(0, Number(value.lastAt) || 0),
+      };
+      if (peer.dayTokens > 0 || peer.monthTokens > 0) data.peers[peerId] = peer;
     }
   }
   if (raw.alerts && typeof raw.alerts === 'object') {
@@ -223,17 +241,28 @@ export class UsageStore extends EventEmitter {
    * @param {{day?: number, month?: number}} [opts.budget] - token 预算
    * @param {() => Date} [opts.now] - 测试注入时钟
    * @param {number} [opts.retentionDays]
+   * @param {number} [opts.maxPeers] - 每用户桶上限（默认 2000）
    */
-  constructor({ path, budget = {}, now = () => new Date(), retentionDays = DEFAULT_RETENTION_DAYS }) {
+  constructor({
+    path,
+    budget = {},
+    now = () => new Date(),
+    retentionDays = DEFAULT_RETENTION_DAYS,
+    maxPeers = DEFAULT_MAX_USAGE_PEERS,
+  }) {
     super();
     this.path = path;
     this.now = now;
     this.retentionDays = retentionDays;
+    this.maxPeers = Number.isFinite(maxPeers) && maxPeers > 0 ? Math.floor(maxPeers) : DEFAULT_MAX_USAGE_PEERS;
     this.budget = {
       day: Number.isFinite(budget?.day) && budget.day > 0 ? budget.day : null,
       month: Number.isFinite(budget?.month) && budget.month > 0 ? budget.month : null,
+      /// 每用户配额；null = 不限
+      userDay: Number.isFinite(budget?.userDay) && budget.userDay > 0 ? budget.userDay : null,
+      userMonth: Number.isFinite(budget?.userMonth) && budget.userMonth > 0 ? budget.userMonth : null,
     };
-    this.data = { version: VERSION, days: {}, alerts: {} };
+    this.data = { version: VERSION, days: {}, alerts: {}, peers: {} };
     this.dirty = false;
   }
 
@@ -244,7 +273,7 @@ export class UsageStore extends EventEmitter {
       this.data = parseData(raw);
     } catch {
       // 损坏就从空开始，不阻塞启动；下一次 record 会覆盖写回
-      this.data = { version: VERSION, days: {}, alerts: {} };
+      this.data = { version: VERSION, days: {}, alerts: {}, peers: {} };
     }
     if (this.#prune()) this.dirty = true;
     return this;
@@ -273,6 +302,20 @@ export class UsageStore extends EventEmitter {
     const modelName = typeof model === 'string' && model.trim() ? model.trim() : 'unknown';
     bucket.models[modelName] = (bucket.models[modelName] ?? 0) + 1;
 
+    // 每用户 token：只用于配额判断，按日/月各自滚动
+    if (peerId) {
+      const peer = String(peerId);
+      const month = key.slice(0, 7);
+      const p = this.data.peers[peer] ?? { day: key, dayTokens: 0, month, monthTokens: 0, lastAt: 0 };
+      if (p.day !== key) { p.day = key; p.dayTokens = 0; }
+      if (p.month !== month) { p.month = month; p.monthTokens = 0; }
+      p.dayTokens += normalized.totalTokens;
+      p.monthTokens += normalized.totalTokens;
+      p.lastAt = at.getTime();
+      this.data.peers[peer] = p;
+      this.#prunePeers();
+    }
+
     this.dirty = true;
     this.#prune(at);
     this.#checkBudget(at);
@@ -294,6 +337,48 @@ export class UsageStore extends EventEmitter {
       budget: { ...this.budget },
       updatedAt: at.toISOString(),
     };
+  }
+
+  /**
+   * 预算预检：租户日 → 租户月 → 用户日 → 用户月，`spent >= limit` 即拒绝。
+   * 只读，不引入锁；warn 模式由调用方决定是否使用结果。
+   *
+   * @param {object} [opts]
+   * @param {string|null} [opts.peerId]
+   * @param {Date} [opts.at]
+   * @returns {{ok: boolean, reason?: string, scope?: 'tenant'|'user', window?: 'day'|'month',
+   *            spent?: number, limit?: number}}
+   */
+  canSpend({ peerId = null, at = this.now() } = {}) {
+    const today = dayKey(at);
+    const month = today.slice(0, 7);
+    const peer = peerId ? this.data.peers[String(peerId)] : null;
+    const peerDaySpent = peer?.day === today ? peer.dayTokens : 0;
+    const peerMonthSpent = peer?.month === month ? peer.monthTokens : 0;
+
+    const checks = [
+      ['tenant', 'day', this.data.days[today]?.totalTokens ?? 0, this.budget.day],
+      ['tenant', 'month', aggregateMonth(this.data.days, month).totalTokens, this.budget.month],
+      ['user', 'day', peerDaySpent, this.budget.userDay],
+      ['user', 'month', peerMonthSpent, this.budget.userMonth],
+    ];
+
+    for (const [scope, window, spent, limit] of checks) {
+      if (!Number.isFinite(limit) || limit <= 0) continue;
+      if (spent >= limit) return { ok: false, scope, window, spent, limit, reason: `${scope}-${window}` };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 每用户用量摘要（供 status / 后续 /usage 使用）。
+   * @param {{limit?: number}} [opts]
+   */
+  peersSummary({ limit = 100 } = {}) {
+    return Object.entries(this.data.peers)
+      .map(([peerId, p]) => ({ peerId, ...p }))
+      .sort((a, b) => b.monthTokens - a.monthTokens || b.lastAt - a.lastAt)
+      .slice(0, limit);
   }
 
   /** 当前日桶（诊断/测试用）。 */
@@ -348,7 +433,28 @@ export class UsageStore extends EventEmitter {
         changed = true;
       }
     }
+
+    // 每用户桶跟着保留期一起清理，避免长期运行后 peers 无限增长
+    const cutoffMs = at.getTime() - this.retentionDays * MS_PER_DAY;
+    for (const [peerId, p] of Object.entries(this.data.peers)) {
+      if (p.lastAt > 0 && p.lastAt < cutoffMs) {
+        delete this.data.peers[peerId];
+        changed = true;
+      }
+    }
+    if (this.#prunePeers()) changed = true;
     return changed;
+  }
+
+  /** 每用户桶超过上限时按 lastAt 淘汰最旧。返回是否有删除。 */
+  #prunePeers() {
+    const entries = Object.entries(this.data.peers);
+    if (entries.length <= this.maxPeers) return false;
+    entries.sort((a, b) => (a[1].lastAt ?? 0) - (b[1].lastAt ?? 0));
+    for (const [peerId] of entries.slice(0, entries.length - this.maxPeers)) {
+      delete this.data.peers[peerId];
+    }
+    return true;
   }
 
   /** 跨过预算阈值时发一次事件；每个日/月周期只发一次。 */

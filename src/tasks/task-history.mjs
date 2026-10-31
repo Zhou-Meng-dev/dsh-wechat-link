@@ -65,6 +65,8 @@ export class TaskHistory {
       result: String(entry.result ?? '').slice(0, 300),
       durationMs: Number.isFinite(entry.durationMs) ? entry.durationMs : null,
       delivery: entry.delivery ? String(entry.delivery) : null,
+      // 任务被跳过的原因（如 budget）；没有原因时为 null
+      reason: entry.reason ? String(entry.reason).slice(0, 100) : null,
     });
     while (this.entries.length > this.maxEntries) this.entries.shift();
     this.dirty = true;

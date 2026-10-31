@@ -203,6 +203,126 @@ await check('CLI usage：默认/--day/--json 都能读到租户 usage.json', asy
   assert.match(bad.stderr, /YYYY-MM-DD/);
 });
 
+// ---------------------------------------------------------------- 预算预检与每用户配额
+
+await check('canSpend：记录 peer 用量，无配额时放行', () => {
+  let now = localDate(2026, 10, 30);
+  const st = new UsageStore({ path: join(root, 'q1.json'), budget: {}, now: () => now });
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 30 } });
+  assert.strictEqual(st.peersSummary()[0].dayTokens, 30);
+  assert.strictEqual(st.canSpend({ peerId: 'u1' }).ok, true);
+});
+
+await check('canSpend：租户日预算，spent >= limit 即拒绝', () => {
+  let now = localDate(2026, 10, 30);
+  const st = new UsageStore({ path: join(root, 'q2.json'), budget: { day: 100 }, now: () => now });
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 60 } });
+  assert.strictEqual(st.canSpend({ at: now }).ok, true);
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 40 } });
+  const r = st.canSpend({ at: now });
+  assert.strictEqual(r.ok, false, '等于预算也必须拦');
+  assert.strictEqual(r.reason, 'tenant-day');
+  assert.strictEqual(r.spent, 100);
+  assert.strictEqual(r.limit, 100);
+});
+
+await check('canSpend：每用户日配额，两个 peer 互不影响', () => {
+  const now = localDate(2026, 10, 30);
+  const st = new UsageStore({
+    path: join(root, 'q3.json'),
+    budget: { userDay: 50 },
+    now: () => now,
+  });
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 50 } });
+  st.record({ at: now, peerId: 'u2', usage: { totalTokens: 10 } });
+
+  const r1 = st.canSpend({ peerId: 'u1', at: now });
+  assert.strictEqual(r1.ok, false);
+  assert.strictEqual(r1.reason, 'user-day');
+  assert.strictEqual(r1.scope, 'user');
+  assert.strictEqual(st.canSpend({ peerId: 'u2', at: now }).ok, true);
+  assert.strictEqual(st.canSpend({ peerId: 'u3', at: now }).ok, true);
+});
+
+await check('canSpend：租户月 / 用户月配额', () => {
+  let now = localDate(2026, 10, 5);
+  const st = new UsageStore({
+    path: join(root, 'q4.json'),
+    budget: { month: 500, userMonth: 200 },
+    now: () => now,
+  });
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 200 } });
+  now = localDate(2026, 10, 20);
+  st.record({ at: now, peerId: 'u2', usage: { totalTokens: 300 } });
+
+  const r = st.canSpend({ peerId: 'u1', at: now });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'tenant-month');
+  assert.strictEqual(r.limit, 500);
+});
+
+await check('canSpend：跨天 / 跨月自动放行', () => {
+  let now = localDate(2026, 10, 30);
+  const st = new UsageStore({
+    path: join(root, 'q5.json'),
+    budget: { day: 500, month: 5000, userDay: 50, userMonth: 200 },
+    now: () => now,
+  });
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 40 } });
+  st.record({ at: now, peerId: 'u2', usage: { totalTokens: 40 } });
+  assert.strictEqual(st.canSpend({ peerId: 'u1', at: now }).ok, true, '40 < 用户日配额 50');
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 10 } });
+  assert.strictEqual(st.canSpend({ peerId: 'u1', at: now }).ok, false, '用户日配额 50 已到');
+
+  // 跨天：租户日与用户日都清零
+  now = localDate(2026, 10, 31);
+  assert.strictEqual(st.canSpend({ peerId: 'u1', at: now }).ok, true, '跨天后应放行');
+
+  // 下个月：月桶清零
+  now = localDate(2026, 11, 1);
+  assert.strictEqual(st.canSpend({ peerId: 'u1', at: now }).ok, true);
+});
+
+await check('v1 usage.json 可读：peers 为空，下一次写盘升 v2', async () => {
+  const p = join(root, 'legacy', 'usage.json');
+  await mkdir(dirname(p), { recursive: true });
+  await writeFile(p, JSON.stringify({
+    version: 1,
+    days: { '2026-10-30': { turns: 2, totalTokens: 55, inputTokens: 30, outputTokens: 25 } },
+    alerts: {},
+  }));
+  let now = localDate(2026, 10, 30);
+  const st = new UsageStore({ path: p, budget: {}, now: () => now });
+  await st.load();
+  assert.deepStrictEqual(st.peersSummary(), []);
+  assert.strictEqual(st.summary().day.totalTokens, 55);
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 5 } });
+  await st.flush();
+  const raw = JSON.parse(await readFile(p, 'utf8'));
+  assert.strictEqual(raw.version, 2);
+  assert.strictEqual(raw.peers.u1.dayTokens, 5);
+});
+
+await check('peersSummary 按本月用量排序', () => {
+  const now = localDate(2026, 10, 30);
+  const st = new UsageStore({ path: join(root, 'q6.json'), budget: {}, now: () => now });
+  st.record({ at: now, peerId: 'a', usage: { totalTokens: 10 } });
+  st.record({ at: now, peerId: 'b', usage: { totalTokens: 30 } });
+  assert.deepStrictEqual(st.peersSummary().map((x) => x.peerId), ['b', 'a']);
+});
+
+await check('peers 超过上限：按 lastAt 淘汰最旧', () => {
+  let now = localDate(2026, 10, 30);
+  const st = new UsageStore({ path: join(root, 'cap.json'), budget: {}, now: () => now, maxPeers: 2 });
+  st.record({ at: now, peerId: 'old', usage: { totalTokens: 1 } });
+  now = new Date(now.getTime() + 1000);
+  st.record({ at: now, peerId: 'mid', usage: { totalTokens: 1 } });
+  now = new Date(now.getTime() + 1000);
+  st.record({ at: now, peerId: 'new', usage: { totalTokens: 1 } });
+  assert.deepStrictEqual(st.peersSummary().map((x) => x.peerId).sort(), ['mid', 'new']);
+  assert.strictEqual(st.peersSummary().some((x) => x.peerId === 'old'), false);
+});
+
 await rm(root, { recursive: true, force: true });
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

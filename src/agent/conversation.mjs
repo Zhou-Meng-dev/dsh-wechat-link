@@ -10,6 +10,7 @@
  */
 
 import { extractAssistantText } from './sdk-client.mjs';
+import { raceWithTimeout } from '../ops/deadline.mjs';
 
 /** 单个回合等待上限。 */
 const TURN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -122,17 +123,13 @@ export class ConversationManager {
     const states = [...this.sessions.values()];
     if (states.length === 0) return { idle: true, busy: 0 };
 
-    let timer = null;
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), Math.max(0, Number(timeoutMs) || 0));
-      timer.unref?.();
-    });
-    const settled = Promise.all(states.map((s) => s.queue)).then(() => 'idle');
-    const outcome = await Promise.race([settled, timeout]);
-    if (timer) clearTimeout(timer);
+    const { timedOut } = await raceWithTimeout(
+      Promise.all(states.map((s) => s.queue)),
+      timeoutMs,
+    );
 
     const busy = states.filter((s) => s.turn).length;
-    return { idle: outcome === 'idle' && busy === 0, busy };
+    return { idle: !timedOut && busy === 0, busy };
   }
 
   // ---------------------------------------------------------------- internals

@@ -21,6 +21,7 @@ import { mkdir, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { TaskStore, formatNextRun, nextDueDelay, WINDOW_MISSED_GRACE_MS } from './tasks.mjs';
+import { raceWithTimeout } from '../ops/deadline.mjs';
 import {
   TaskHistory,
   formatTaskFailureNotice,
@@ -30,6 +31,9 @@ import {
 /** agent 用这个标记表示“本次触发不打扰用户”，例如上一题还没回答。 */
 export const TASK_SKIP_MARKER = '[[skip]]';
 
+/** 任务预算跳过提示的窗口：每天一次 */
+const BUDGET_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export class TaskRuntime {
   /**
    * @param {object} opts
@@ -38,6 +42,10 @@ export class TaskRuntime {
    * @param {{send: (peerId: string, text: string, token?: string) => Promise<{sent:number,queued:number}>}} opts.reply
    * @param {(peerId: string) => string|undefined} [opts.getContextToken]
    * @param {() => boolean} [opts.isActive]  - 是否处于 running，用状态机判断而不是读私有字段
+   * @param {{action: 'warn'|'block', canSpend(peerId: string): object}|null} [opts.budgetGuard]
+   *        预算守卫：block 且超限时跳过任务（含手动 runNow）
+   * @param {{canSend(peerId: string, key: string, opts?: object): boolean}|null} [opts.notice]
+   *        共享提示节流器（任务预算提示每天一次）
    * @param {(msg: string) => void} [opts.log]
    */
   constructor({
@@ -46,6 +54,8 @@ export class TaskRuntime {
     reply,
     getContextToken = () => undefined,
     isActive = () => true,
+    budgetGuard = null,
+    notice = null,
     log = () => {},
   }) {
     this.tenant = tenant;
@@ -53,6 +63,8 @@ export class TaskRuntime {
     this.reply = reply;
     this.getContextToken = getContextToken;
     this.isActive = isActive;
+    this.budgetGuard = budgetGuard;
+    this.notice = notice;
     this.log = log;
 
     /** @type {TaskStore|null} */
@@ -69,6 +81,8 @@ export class TaskRuntime {
     this.watchers = [];
     this.tickRunning = false;
     this.tickPending = false;
+    /** 在途任务 promise（stop 用来等到截止时间） */
+    this.inflight = new Set();
     /** 自己刚写过 tasks.json 的时间，用于忽略自激事件 */
     this.tasksSelfWriteAt = 0;
     this.tasksMtime = 0;
@@ -97,8 +111,12 @@ export class TaskRuntime {
     this.#scheduleReconcile(0);
   }
 
-  /** 停掉调度器/监听并刷盘任务与历史；可重复调用。 */
-  async stop() {
+  /**
+   * 停掉调度器/监听并刷盘任务与历史；可重复调用。
+   * 在途任务会等到 `timeoutMs` 截止（Tenant 在之后才会关 dsh，避免把回复杀掉）。
+   * @param {{timeoutMs?: number}} [opts]
+   */
+  async stop({ timeoutMs = 20_000 } = {}) {
     if (this.stopped) return;
     this.stopped = true;
     if (this.schedulerTimer) { clearInterval(this.schedulerTimer); this.schedulerTimer = null; }
@@ -108,6 +126,15 @@ export class TaskRuntime {
       try { w.close(); } catch { /* ignore */ }
     }
     this.watchers = [];
+
+    // 等在途任务到同一截止时间：与 Tenant 的 drain 共享 budget。
+    if (this.inflight.size > 0) {
+      await raceWithTimeout(Promise.allSettled([...this.inflight]), timeoutMs);
+      if (this.inflight.size > 0) {
+        this.log(`[task] 仍有 ${this.inflight.size} 个任务未在 ${timeoutMs}ms 内结束`);
+      }
+    }
+
     await this.tasks?.flush().catch(() => {});
     await this.taskHistory?.flush().catch(() => {});
   }
@@ -116,8 +143,20 @@ export class TaskRuntime {
   async runNow(taskId) {
     const task = this.tasks?.get(taskId);
     if (!task) return false;
-    await this.#runTask(task);
+    await this.#runTaskTracked(task);
     return true;
+  }
+
+  /**
+   * 执行任务并把 promise 记入 `inflight`，让 stop() 能等到在途任务结束。
+   * 失败只记日志（不抛出），保持原有「一个任务失败不拖垮调度」的语义。
+   */
+  #runTaskTracked(task) {
+    const p = this.#runTask(task)
+      .catch((err) => this.log(`[task] 执行「${task.title}」失败: ${err.message}`))
+      .finally(() => this.inflight.delete(p));
+    this.inflight.add(p);
+    return p;
   }
 
   // ---------------------------------------------------------------- 调度
@@ -321,6 +360,26 @@ export class TaskRuntime {
       await this.#flushTasks();
       return;
     }
+    // 预算硬拦截：定时触发与手动 runNow 都受约束，
+    // 拒绝时只写历史 + 一条提示，不调用 agent。
+    const budget = this.budgetGuard?.action === 'block'
+      ? this.budgetGuard.canSpend?.(peer)
+      : null;
+    if (budget && budget.ok === false) {
+      this.log(`[task] ⛔ 预算已用完（${budget.reason}），跳过「${task.title}」`);
+      this.tasks.markRun(task.id, { ok: false, result: 'skipped' });
+      await this.#recordTaskRun(task, {
+        ok: false,
+        result: 'skipped',
+        reason: 'budget',
+        delivery: 'skipped',
+        durationMs: Date.now() - startedAt,
+      });
+      await this.#flushTasks();
+      await this.#notifyBudgetSkip(peer, budget);
+      return;
+    }
+
     if (!token) {
       this.log('[task] 缺少 context_token：先生成回复，发送失败后进入待发队列，等用户下次发消息补发');
     }
@@ -384,6 +443,30 @@ export class TaskRuntime {
       ...info,
     });
     await writeTaskHistorySnapshot(this.tenant.cwd, this.taskHistory.list()).catch(() => {});
+  }
+
+  /**
+   * 预算跳过提示：发给 owner，每天最多一条。
+   * 复用共享 NoticeThrottle（按 24h 窗口覆盖默认 5 分钟）。
+   */
+  async #notifyBudgetSkip(peer, check) {
+    const target = this.tenant.ownerId ?? peer;
+    if (!target) return;
+    if (this.notice && !this.notice.canSend(target, 'task-budget', { windowMs: BUDGET_NOTICE_WINDOW_MS })) {
+      return;
+    }
+    const label = check.window === 'month' ? '本月' : '今日';
+    try {
+      const token = this.getContextToken(target);
+      const delivery = await this.reply.send(
+        target,
+        `💸 ${label} token 预算已用完（${check.spent}/${check.limit}），本次定时任务已跳过。回复 /usage 查看明细。`,
+        token,
+      );
+      this.log(`[task] 已发送预算跳过提示给 ${target.slice(0, 12)}…${delivery?.queued > 0 ? '（进入待发队列）' : ''}`);
+    } catch (err) {
+      this.log(`[task] 发送预算跳过提示失败: ${err.message}`);
+    }
   }
 
   /** 失败时给 owner 一条提示；token 失效时这条提示也会进待发队列。 */
