@@ -16,6 +16,10 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { newClientId } from './ids.mjs';
+
+export { newClientId };
+
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const DEFAULT_API_TIMEOUT_MS = 15_000;
@@ -37,6 +41,22 @@ export class IlinkSendError extends Error {
     this.name = 'IlinkSendError';
     this.ret = ret;
     this.errmsg = errmsg;
+  }
+}
+
+/**
+ * HTTP 层错误：保留状态码与响应片段。
+ *
+ * 之前只抛 `new Error('... HTTP 500 ...')`，上层只能靠正则猜 4xx / 5xx / 429，
+ * 无法稳定决定「重试」还是「进 DLQ」。状态码必须是一等字段。
+ */
+export class IlinkHttpError extends Error {
+  constructor(message, { status, bodySnippet, endpoint } = {}) {
+    super(message);
+    this.name = 'IlinkHttpError';
+    this.status = status;
+    this.bodySnippet = bodySnippet ?? '';
+    this.endpoint = endpoint;
   }
 }
 
@@ -89,14 +109,24 @@ export class IlinkClient {
     this.token = opts.token;
     this.baseUrl = normalizeBase(opts.baseUrl || DEFAULT_BASE_URL);
     this.log = opts.log ?? ((m) => console.error(`[ilink] ${m}`));
-    /** 服务端返回的长轮询上下文 */
+    /**
+     * 服务端返回的长轮询上下文。
+     *
+     * 只有调用方显式 `advanceCursor()` 才会前进 —— 游标必须在「消息已落盘」
+     * 之后才推进，否则「写盘失败但游标已前进」的窗口会丢消息。
+     */
     this.syncBuf = '';
     this.stopped = false;
+    /** 在途请求的 controller，shutdown 时用来中断长轮询 */
+    this.abortController = null;
   }
 
   async #post(endpoint, body, timeoutMs = DEFAULT_API_TIMEOUT_MS) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    // 记录在途 controller，供 abort() 中断（关闭时不再等 35s 长轮询）
+    const previous = this.abortController;
+    this.abortController = ctl;
     try {
       const res = await fetch(this.baseUrl + endpoint, {
         method: 'POST',
@@ -105,25 +135,50 @@ export class IlinkClient {
         signal: ctl.signal,
       });
       const text = await res.text();
-      if (!res.ok) throw new Error(`${endpoint} HTTP ${res.status}: ${text.slice(0, 200)}`);
+      if (!res.ok) {
+        throw new IlinkHttpError(
+          `${endpoint} HTTP ${res.status}: ${text.slice(0, 200)}`,
+          { status: res.status, bodySnippet: text.slice(0, 500), endpoint },
+        );
+      }
       return JSON.parse(text);
     } finally {
       clearTimeout(timer);
+      if (this.abortController === ctl) this.abortController = previous;
+    }
+  }
+
+  /**
+   * 推进长轮询游标。空值（服务端没返回 get_updates_buf）不改变旧游标。
+   * @param {string|undefined} buf
+   */
+  advanceCursor(buf) {
+    if (typeof buf === 'string' && buf) this.syncBuf = buf;
+  }
+
+  /** 中断在途请求（关闭时使用）。之后的新请求不会被阻止，由调用方状态机控制。 */
+  abort() {
+    try {
+      this.abortController?.abort();
+    } catch {
+      /* 已结束的 controller 不需要处理 */
     }
   }
 
   /**
    * 长轮询拉取新消息。
+   *
+   * 注意：**不再自动推进游标**。调用方必须先持久化 `resp.msgs`，再调用
+   * `advanceCursor(resp.get_updates_buf)`；否则崩溃会丢消息。
+   *
    * @returns {Promise<{msgs: any[], ret: number, errcode?: number, errmsg?: string}>}
    */
   async getUpdates(timeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS) {
-    const resp = await this.#post(
+    return this.#post(
       'ilink/bot/getupdates',
       { get_updates_buf: this.syncBuf ?? '', base_info: baseInfo() },
       timeoutMs,
     );
-    if (resp.get_updates_buf) this.syncBuf = resp.get_updates_buf;
-    return resp;
   }
 
   /** 发送一条消息并检查 ret。 */
@@ -149,12 +204,13 @@ export class IlinkClient {
    * @param {string} opts.toUserId      - 目标用户 id
    * @param {string} opts.text
    * @param {string} [opts.contextToken] - 回复时必须带，取自收到的消息
+   * @param {string} [opts.clientId]     - 幂等键；重试时传入首次生成的值
    */
-  async sendText({ toUserId, text, contextToken }) {
+  async sendText({ toUserId, text, contextToken, clientId }) {
     const msg = {
       from_user_id: '',
       to_user_id: toUserId,
-      client_id: `dsh-${randomBytes(6).toString('hex')}`,
+      client_id: clientId || newClientId(),
       message_type: MessageType.BOT,
       message_state: 2, // FINISH
       create_time_ms: Date.now(),
@@ -201,12 +257,13 @@ export class IlinkClient {
    * @param {string} opts.encryptQueryParam - CDN 响应头 x-encrypted-param
    * @param {string} opts.aesKeyHex         - AES-128 key hex（32 字符）
    * @param {number} opts.ciphertextSize    - 加密后的字节数（mid_size）
+   * @param {string} [opts.clientId]        - 幂等键；重试时传入首次生成的值
    */
-  async sendImageItem({ toUserId, contextToken, encryptQueryParam, aesKeyHex, ciphertextSize }) {
+  async sendImageItem({ toUserId, contextToken, encryptQueryParam, aesKeyHex, ciphertextSize, clientId }) {
     const msg = {
       from_user_id: '',
       to_user_id: toUserId,
-      client_id: `dsh-${randomBytes(6).toString('hex')}`,
+      client_id: clientId || newClientId(),
       message_type: MessageType.BOT,
       message_state: 2, // FINISH
       create_time_ms: Date.now(),
@@ -236,12 +293,13 @@ export class IlinkClient {
    * @param {string} opts.aesKeyHex         - AES-128 key hex（32 字符）
    * @param {string} opts.fileName          - 展示给用户的文件名
    * @param {number} opts.plaintextSize     - 原文件字节数（协议字段 len 是字符串）
+   * @param {string} [opts.clientId]        - 幂等键；重试时传入首次生成的值
    */
-  async sendFileItem({ toUserId, contextToken, encryptQueryParam, aesKeyHex, fileName, plaintextSize }) {
+  async sendFileItem({ toUserId, contextToken, encryptQueryParam, aesKeyHex, fileName, plaintextSize, clientId }) {
     const msg = {
       from_user_id: '',
       to_user_id: toUserId,
-      client_id: `dsh-${randomBytes(6).toString('hex')}`,
+      client_id: clientId || newClientId(),
       message_type: MessageType.BOT,
       message_state: 2, // FINISH
       create_time_ms: Date.now(),

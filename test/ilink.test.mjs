@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 
 import {
   IlinkClient,
+  IlinkHttpError,
   IlinkSendError,
   isTokenExpiredError,
   extractInboundText,
@@ -180,6 +181,115 @@ await check('ret=0 时正常返回', async () => {
 });
 
 server.close();
+
+// ---------------------------------------------------------------- 游标 / 状态码 / clientId / abort
+
+let httpStatus = 200;
+let httpBody = '{}';
+let lastReqBody = null;
+let lastReqPath = null;
+let hangResponses = false;
+
+const server2 = createServer(async (req, res) => {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  lastReqBody = Buffer.concat(chunks).toString('utf8');
+  lastReqPath = req.url;
+  if (hangResponses) {
+    // 模拟长轮询：不响应，等客户端 abort
+    setTimeout(() => { try { res.end('{}'); } catch { /* 已断开 */ } }, 200);
+    return;
+  }
+  res.writeHead(httpStatus, { 'content-type': 'application/json' });
+  res.end(httpBody);
+});
+await new Promise((resolve) => server2.listen(0, '127.0.0.1', resolve));
+const port2 = server2.address().port;
+const base2 = `http://127.0.0.1:${port2}/`;
+
+await check('非 2xx 抛出 IlinkHttpError 并保留 status/endpoint', async () => {
+  httpStatus = 503;
+  httpBody = 'upstream down';
+  const ilink = new IlinkClient({ token: 't', baseUrl: base2 });
+  await assert.rejects(
+    () => ilink.sendText({ toUserId: 'u', text: 'hi' }),
+    (err) => {
+      assert.ok(err instanceof IlinkHttpError);
+      assert.strictEqual(err.status, 503);
+      assert.match(err.endpoint, /sendmessage/);
+      assert.match(err.bodySnippet, /upstream down/);
+      return true;
+    },
+  );
+});
+
+await check('getUpdates 不再隐式推进游标；advanceCursor 才推进', async () => {
+  httpStatus = 200;
+  httpBody = JSON.stringify({ ret: 0, get_updates_buf: 'B1', msgs: [{ from_user_id: 'u' }] });
+  const ilink = new IlinkClient({ token: 't', baseUrl: base2 });
+  const resp = await ilink.getUpdates(500);
+  assert.strictEqual(resp.get_updates_buf, 'B1');
+  assert.strictEqual(ilink.syncBuf, '', '写盘前不能推进游标');
+  assert.strictEqual(JSON.parse(lastReqBody).get_updates_buf, '');
+
+  ilink.advanceCursor(resp.get_updates_buf);
+  assert.strictEqual(ilink.syncBuf, 'B1');
+
+  // 服务端没返回 get_updates_buf 时保留旧游标（不能清空）
+  httpBody = JSON.stringify({ ret: 0, msgs: [] });
+  await ilink.getUpdates(500);
+  assert.strictEqual(ilink.syncBuf, 'B1');
+  assert.strictEqual(JSON.parse(lastReqBody).get_updates_buf, 'B1');
+});
+
+await check('advanceCursor 忽略空值', () => {
+  const ilink = new IlinkClient({ token: 't', baseUrl: base2 });
+  ilink.advanceCursor('X');
+  ilink.advanceCursor('');
+  ilink.advanceCursor(undefined);
+  assert.strictEqual(ilink.syncBuf, 'X');
+});
+
+await check('sendText/sendImageItem/sendFileItem 透传 clientId', async () => {
+  httpStatus = 200;
+  httpBody = JSON.stringify({ ret: 0 });
+  const ilink = new IlinkClient({ token: 't', baseUrl: base2 });
+
+  await ilink.sendText({ toUserId: 'u', text: 'hi', clientId: 'cid-text' });
+  assert.strictEqual(JSON.parse(lastReqBody).msg.client_id, 'cid-text');
+
+  await ilink.sendImageItem({
+    toUserId: 'u', clientId: 'cid-img', encryptQueryParam: 'q', aesKeyHex: 'a'.repeat(32), ciphertextSize: 10,
+  });
+  assert.strictEqual(JSON.parse(lastReqBody).msg.client_id, 'cid-img');
+
+  await ilink.sendFileItem({
+    toUserId: 'u', clientId: 'cid-file', encryptQueryParam: 'q', aesKeyHex: 'a'.repeat(32), fileName: 'a.txt', plaintextSize: 3,
+  });
+  assert.strictEqual(JSON.parse(lastReqBody).msg.client_id, 'cid-file');
+
+  // 不传 clientId 时仍然自动生成
+  await ilink.sendText({ toUserId: 'u', text: 'hi' });
+  assert.match(JSON.parse(lastReqBody).msg.client_id, /^dsh-[0-9a-f]{12}$/);
+});
+
+await check('abort() 中断在途长轮询', async () => {
+  hangResponses = true;
+  try {
+    const ilink = new IlinkClient({ token: 't', baseUrl: base2 });
+    const pending = ilink.getUpdates(10_000);
+    setTimeout(() => ilink.abort(), 20);
+    await assert.rejects(pending, (err) => {
+      assert.strictEqual(err.name, 'AbortError');
+      return true;
+    });
+    assert.ok(lastReqPath.includes('getupdates'));
+  } finally {
+    hangResponses = false;
+  }
+});
+
+server2.close();
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);
