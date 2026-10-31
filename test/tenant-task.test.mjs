@@ -261,6 +261,28 @@ await check('stop() 等在途任务结束（不超过 timeoutMs）', async () =>
   await running;
 });
 
+await check('一次性任务执行完：从清单移除，历史仍保留', async () => {
+  sent.length = 0;
+  const task = t.taskRuntime.tasks.add({
+    schedule: { kind: 'once', at: '2026-10-31 10:00' },
+    prompt: '提醒喝水',
+    title: '一次性提醒',
+  });
+  await t.taskRuntime.tasks.flush();
+
+  t.session.ask = async () => '到点啦，喝口水吧';
+  await t.runTaskNow(task.id);
+
+  assert.strictEqual(t.taskRuntime.tasks.get(task.id), undefined, '执行完不应留在内存清单');
+  const onDisk = JSON.parse(await readFile(join(root, 'tasks.json'), 'utf8'));
+  assert.ok(!onDisk.tasks.some((x) => x.id === task.id), 'tasks.json 里也不应留下');
+
+  const entry = t.taskRuntime.taskHistory.list().at(-1);
+  assert.strictEqual(entry.taskId, task.id);
+  assert.strictEqual(entry.ok, true);
+  assert.strictEqual(entry.delivery, 'sent');
+});
+
 await rm(root, { recursive: true, force: true });
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

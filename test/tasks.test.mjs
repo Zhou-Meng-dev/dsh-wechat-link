@@ -156,16 +156,38 @@ await check('due 只认已到点，不会提前触发', async () => {
   assert.ok(s.due(Date.now()).some((x) => x.id === t.id), '容差内应触发');
 });
 
-await check('once 任务跑完自动停用', async () => {
+await check('once 任务跑完从清单移除（只留历史）', async () => {
   const p4 = join(dir, 'once.json');
   const s = new TaskStore(p4);
   await s.load();
   const t = s.add({ schedule: { kind: 'once', at: '2020-01-01 00:00' }, prompt: 'x' });
   s.markRun(t.id, { ok: true });
-  const after = s.get(t.id);
-  assert.strictEqual(after.enabled, false);
-  assert.strictEqual(after.nextRunAt, null);
-  assert.strictEqual(after.lastResult, 'ok');
+  assert.strictEqual(s.get(t.id), undefined, '执行完不能继续留在 tasks.json');
+  assert.deepStrictEqual(s.list(), []);
+
+  await s.flush();
+  const reloaded = new TaskStore(p4);
+  await reloaded.load();
+  assert.deepStrictEqual(reloaded.list(), [], '重新加载后不应复活');
+});
+
+await check('pruneExecutedOnce 清掉旧版本遗留的已执行 once 任务', async () => {
+  const p = join(dir, 'prune.json');
+  const s = new TaskStore(p);
+  await s.load();
+  const legacy = s.add({ schedule: { kind: 'once', at: '2020-01-01 00:00' }, prompt: 'legacy' });
+  const futureOnce = s.add({ schedule: { kind: 'once', at: '2099-01-01 00:00' }, prompt: 'future' });
+  const daily = s.add({ schedule: { kind: 'daily', time: '09:00' }, prompt: 'daily' });
+
+  // 模拟旧版本：执行过但只被停用
+  const t = s.get(legacy.id);
+  t.lastRunAt = '2026-01-01T00:00:00.000Z';
+  t.enabled = false;
+
+  assert.deepStrictEqual(s.pruneExecutedOnce(), [legacy.id]);
+  assert.strictEqual(s.get(legacy.id), undefined);
+  assert.ok(s.get(futureOnce.id), '没执行过的一次性任务要保留');
+  assert.ok(s.get(daily.id), '周期任务要保留');
 });
 
 await check('daily 跑完后下次一定在未来', async () => {

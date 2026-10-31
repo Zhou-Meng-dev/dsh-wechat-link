@@ -97,6 +97,12 @@ export class TaskRuntime {
     this.tasks = new TaskStore(join(this.tenant.root, 'tasks.json'));
     await this.tasks.load();
     this.tasksMtime = this.tasks.loadedMtime || 0;
+    // 旧版本执行完的一次性任务只会被停用，不会消失；启动时顺手清掉。
+    const stamped = this.tasks.pruneExecutedOnce();
+    if (stamped.length > 0) {
+      this.log(`[task] 清理 ${stamped.length} 个已执行的一次性任务（记录保留在 task-history.json）`);
+      await this.tasks.flush().catch(() => {});
+    }
     const enabled = this.tasks.list().filter((t) => t.enabled).length;
     if (enabled > 0) this.log(`已加载 ${enabled} 个启用的定时任务`);
 

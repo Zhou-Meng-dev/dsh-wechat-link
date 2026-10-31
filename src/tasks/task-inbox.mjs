@@ -85,6 +85,7 @@ prompt 字段写的是**给未来自己的指令**，不是最终发给用户的
 - \`/new\` 或服务重启后先 \`quiz.py status\` 恢复进度，不要凭记忆。
 
 查看已有任务：读 _tasks/current.json（含 id / title / schedule / nextRunAt / lastResult，任务变化时桥接会刷新）。
+一次性任务执行完会自动从清单移除；用户问「为什么没提醒」时，先读 _tasks/history.json 看那次执行的结果。
 
 **必须等桥接处理完再回复**：写完请求文件后，立刻运行
 

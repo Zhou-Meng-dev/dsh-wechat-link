@@ -545,6 +545,20 @@ export class TaskStore {
     return true;
   }
 
+  /**
+   * 清理「已经执行过的一次性任务」。
+   *
+   * 旧版本跑完只把 enabled 置 false，任务会一直留在清单里；这些任务已不会再触发，
+   * 记录在 task-history.json，可以从 tasks.json 移除（保留 history）。
+   *
+   * @returns {string[]} 被移除的任务 id
+   */
+  pruneExecutedOnce() {
+    const stale = this.data.tasks.filter((t) => t.schedule?.kind === 'once' && t.lastRunAt);
+    for (const t of stale) this.remove(t.id);
+    return stale.map((t) => t.id);
+  }
+
   setEnabled(id, enabled) {
     const t = this.get(id);
     if (!t) return false;
@@ -648,14 +662,17 @@ export class TaskStore {
     if (!t) return;
     t.lastRunAt = new Date().toISOString();
     t.lastResult = ok ? String(result ?? 'ok') : String(result ?? 'error').slice(0, 200);
+
+    // 一次性任务执行完（成功 / 失败 / 跳过都算）就从清单移除：
+    // 它不会再触发，留在 tasks.json 只会让 /tasks 和 agent 看到一堆死任务。
+    // 执行记录由 TaskHistory 单独持久化到 task-history.json。
     if (t.schedule?.kind === 'once') {
-      t.enabled = false;
-      t.nextRunAt = null;
-    } else {
-      // 从"现在"推下一次，避免积压时连发；窗口任务会跳过已经错过的点
-      const next = computeNextRun(t.schedule, Date.now(), { seed: t.id });
-      t.nextRunAt = next;
+      this.remove(id);
+      return;
     }
+
+    // 从"现在"推下一次，避免积压时连发；窗口任务会跳过已经错过的点
+    t.nextRunAt = computeNextRun(t.schedule, Date.now(), { seed: t.id });
     this.ops.push({ kind: 'run', id, ok, result: t.lastResult });
     this.dirty = true;
   }

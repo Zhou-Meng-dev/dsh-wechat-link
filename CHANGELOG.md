@@ -26,6 +26,9 @@
 - `outbox.json` 升至 v2：新增 `seq` / `clientId` / `attempts` / `nextAttemptAt` / `lastError`；
   兼容读取 v1，顶层仍是 `peers`，回滚到旧版本仍可读取。
 - `usage.json` 升至 v2：新增 `peers`（每用户日/月 token）；旧文件按空 `peers` 读入。
+- 一次性定时任务执行完（成功 / 失败 / 跳过）后从 `tasks.json` 移除，只在 `task-history.json`
+  与 `_tasks/history.json` 保留记录；`/tasks` 与 `_tasks/current.json` 只显示还没执行的任务。
+  升级启动时会清理旧版本遗留的「已执行但被停用」的一次性任务。
 - 媒体上传失败改为入队 `media-file`，补发时重新上传并再次经过工作区白名单校验。
 - 默认 `maxConcurrentTurns=4`：多个用户同时提问时最多 4 个并发（单用户串行行为不变）。
 - 默认输入上限（`queueMaxPerPeer=20`、`perUserRatePerMinute=20`、`maxMessageChars=8000`）

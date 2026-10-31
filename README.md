@@ -185,6 +185,8 @@ node src/main.mjs task <id> rm|enable|disable|update|snooze ...
 - 窗口任务适合「每天随机考我几次」：每次触发只问一道题；agent 用工作区 `_tools/quiz.py` 维护 `_quiz/state.json`（当前题目、分数、历史）。如果上一题还没回答，agent 只输出 `[[skip]]`，桥接不会发送消息。
 - `/new` 只清对话上下文和链接缓存，**不会**删除 `tasks.json`、任务历史或 `_quiz/` 里的计分；下一次触发会从状态文件恢复。
 - 任务历史写入 `task-history.json` 和 `_tasks/history.json`；失败会给 owner 发可操作提示。
+- 一次性任务执行完（成功/失败/跳过）会从 `tasks.json` 移除，只在任务历史里留记录；`/tasks` 与 `_tasks/current.json` 只列还没执行的任务。
+
 - 主动推送依赖 `context_token`；token 失效时消息进 `outbox.json`，用户下次发消息后补发，不丢。
 
 ## 微信内置命令
