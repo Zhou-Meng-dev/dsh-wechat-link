@@ -109,6 +109,32 @@ export class ConversationManager {
     };
   }
 
+  /**
+   * 等所有会话的当前回合结束（关闭流程用）。
+   *
+   * state.queue 已经串起了该会话的全部回合，所以只需要等它；
+   * 不引入新锁，也不阻塞新回合（关闭时调用方已停止接收新消息）。
+   *
+   * @param {{timeoutMs?: number}} [opts]
+   * @returns {Promise<{idle: boolean, busy: number}>}
+   */
+  async waitIdle({ timeoutMs = 20_000 } = {}) {
+    const states = [...this.sessions.values()];
+    if (states.length === 0) return { idle: true, busy: 0 };
+
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), Math.max(0, Number(timeoutMs) || 0));
+      timer.unref?.();
+    });
+    const settled = Promise.all(states.map((s) => s.queue)).then(() => 'idle');
+    const outcome = await Promise.race([settled, timeout]);
+    if (timer) clearTimeout(timer);
+
+    const busy = states.filter((s) => s.turn).length;
+    return { idle: outcome === 'idle' && busy === 0, busy };
+  }
+
   // ---------------------------------------------------------------- internals
 
   #sessionOf(peerId) {

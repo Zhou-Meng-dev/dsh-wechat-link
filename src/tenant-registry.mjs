@@ -52,11 +52,15 @@ export class TenantRegistry extends EventEmitter {
     return t;
   }
 
-  /** 停止并从内存移除（不负责改配置） */
-  async remove(id) {
+  /**
+   * 停止并从内存移除（不负责改配置）。
+   * @param {string} id
+   * @param {{drain?: boolean, timeoutMs?: number}} [opts] - 热重载传 { drain:false }
+   */
+  async remove(id, opts) {
     const t = this.tenants.get(id);
     if (!t) return false;
-    await t.stop();
+    await t.stop(opts);
     this.tenants.delete(id);
     this.emit('tenant-removed', t);
     return true;
@@ -70,7 +74,35 @@ export class TenantRegistry extends EventEmitter {
     return [...this.tenants.values()].map((t) => t.status());
   }
 
-  async stopAll() {
-    await Promise.all([...this.tenants.values()].map((t) => t.stop()));
+  /**
+   * 强制退出前的诊断快照：仍未 commit 的入站消息。
+   * @returns {{ids: string[], pending: number}}
+   */
+  abandoned() {
+    const ids = [];
+    let pending = 0;
+    for (const t of this.tenants.values()) {
+      ids.push(...(t.abandonedIds?.() ?? []));
+      pending += t.journal?.stats?.().pending ?? 0;
+    }
+    return { ids, pending };
+  }
+
+  /**
+   * 并行停止所有租户，共享同一个截止时间。
+   *
+   * 每个租户拿到的是「距离截止时间还剩多少」，而不是各自 20s ——
+   * 否则 N 个租户串行会把 K8s 的 terminationGracePeriodSeconds 撑爆。
+   *
+   * @param {{timeoutMs?: number, drain?: boolean}} [opts]
+   */
+  async stopAll({ timeoutMs = 20_000, drain = true } = {}) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    await Promise.all(
+      [...this.tenants.values()].map((t) => t.stop({
+        drain,
+        timeoutMs: Math.max(0, deadline - Date.now()),
+      })),
+    );
   }
 }

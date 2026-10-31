@@ -8,6 +8,7 @@ import { bridgeHome, maskKey, resolveDefaultApiKey, sandboxRoot, setupMarkerPath
 import { createHealthServer } from '../../ops/health.mjs';
 import { assertPreflight } from '../../ops/preflight.mjs';
 import { tenantListKey } from '../../ops/reload.mjs';
+import { createShutdownController } from '../../ops/shutdown.mjs';
 import { runSetup, shouldRunSetup } from '../../ops/setup.mjs';
 import { applySandboxEnv, resolveSandbox } from '../../sandbox/sandbox-env.mjs';
 import { TenantRegistry } from '../../tenant-registry.mjs';
@@ -186,7 +187,7 @@ export async function cmdServe() {
         const existing = registry.get(tenant.id);
         if (existing && tenantListKey([existing.tenant]) !== tenantListKey([tenant])) {
           log(`租户 ${tenant.id} 配置已变更，重启中…`);
-          await registry.remove(tenant.id).catch(() => {});
+          await registry.remove(tenant.id, { drain: false }).catch(() => {});
           await registry.add(tenant).catch((e) => warn(`重启 ${tenant.id} 失败: ${e.message}`));
         }
       }
@@ -194,7 +195,7 @@ export async function cmdServe() {
       for (const existing of registry.list()) {
         if (!freshIds.includes(existing.id)) {
           log(`检测到租户 ${existing.id} 被移除，停止中…`);
-          await registry.remove(existing.id).catch(() => {});
+          await registry.remove(existing.id, { drain: false }).catch(() => {});
         }
       }
     } catch (err) {
@@ -205,16 +206,27 @@ export async function cmdServe() {
   // 没有任何租户时，若把它 unref，事件循环为空，进程会立刻退出，
   // 于是"空跑等登录"根本等不到第一个人。
 
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    clearInterval(reloadTimer);
-    try { healthServer?.close(); } catch { /* 未成功 listen 时 close 会抛 */ }
-    log('正在关闭所有租户…');
-    await registry.stopAll();
-    setTimeout(() => process.exit(0), 1000);
-  };
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
+  // 优雅退出：第一次 SIGTERM/SIGINT 排空在途回合；第二次立即退出；
+  // 超过 BRIDGE_SHUTDOWN_TIMEOUT_MS（默认 20s）强制退出（exit 130）。
+  // 部署模板的 terminationGracePeriodSeconds / stop_grace_period 是 30s，留足余量。
+  const shutdown = createShutdownController({
+    log: warn,
+    stopAll: async ({ timeoutMs }) => {
+      clearInterval(reloadTimer);
+      try { healthServer?.close(); } catch { /* 未成功 listen 时 close 会抛 */ }
+      log(`正在关闭所有租户（最多 ${Math.round(timeoutMs / 1000)}s）…`);
+      await registry.stopAll({ timeoutMs });
+    },
+    // 强制退出（超时 / 第二次信号）前记录仍未完成的入站消息 id 与待重放条数。
+    onForce: () => {
+      const { ids, pending } = registry.abandoned();
+      if (ids.length === 0 && pending === 0) return '强制退出：没有未完成的入站消息';
+      const preview = ids.slice(0, 5).map((id) => String(id).slice(0, 12)).join(', ');
+      const more = ids.length > 5 ? ` 等 ${ids.length} 条` : '';
+      return `强制退出：${ids.length} 条在途消息未完成（${preview}${more}），`
+        + `${pending} 条保留在 sync.json.pending 等待重放`;
+    },
+  });
+  process.on('SIGINT', () => shutdown.handle('SIGINT'));
+  process.on('SIGTERM', () => shutdown.handle('SIGTERM'));
 }

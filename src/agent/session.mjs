@@ -201,6 +201,12 @@ export class AgentSession extends EventEmitter {
     return this.#conv ? this.#conv.stats() : null;
   }
 
+  /** 等会话里正在跑的回合结束（关闭排空用）；未启动时视为空闲。 */
+  waitIdle(opts) {
+    if (!this.#conv) return Promise.resolve({ idle: true, busy: 0 });
+    return this.#conv.waitIdle(opts);
+  }
+
   /** 最新 context_token：内存优先，其次落盘值。 */
   getToken(peerId) {
     return this.#contextTokens.get(peerId) ?? this.#sessionStore?.getToken(peerId);
