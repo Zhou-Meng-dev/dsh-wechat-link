@@ -134,6 +134,8 @@ export class TurnCounter {
     /** @type {Map<string, {turns: number, lastAt: number}>} */
     this.peers = new Map();
     this.dirty = false;
+    /** 串行化写盘：并发回合不能互相覆盖快照 */
+    this.chain = Promise.resolve();
   }
 
   /** 读取；损坏时从空开始（计数损坏不该阻塞服务）。 */
@@ -181,13 +183,17 @@ export class TurnCounter {
     cur.lastAt = this.now().getTime();
     this.peers.set(peerId, cur);
     this.#prune();
-    await this.writeJson(this.path, this.#snapshot(), { mode: 0o600 });
+    const snapshot = this.#snapshot();
+    const write = this.chain.then(() => this.writeJson(this.path, snapshot, { mode: 0o600 }));
+    this.chain = write.catch(() => {});
+    await write;
     this.dirty = false;
     return cur.turns;
   }
 
-  /** 兼容 stop() 的刷盘调用；recordTurn 已经即时写盘。 */
+  /** 兼容 stop() 的刷盘调用；recordTurn 已经串行写盘。 */
   async flush() {
+    await this.chain.catch(() => {});
     if (!this.dirty) return false;
     await this.writeJson(this.path, this.#snapshot(), { mode: 0o600 });
     this.dirty = false;

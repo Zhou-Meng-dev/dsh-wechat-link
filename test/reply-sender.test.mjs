@@ -510,6 +510,58 @@ await check('连续 6 次失败后进 DLQ', async () => {
   assert.strictEqual(outbox.moved[0].attempts, 6);
 });
 
+await check('已有积压时新回复排队，不越过退避中的旧消息', async () => {
+  const outbox = new MemoryOutbox();
+  const now = 1_000_000;
+  outbox.add('user-1', { type: 'text', text: '旧回复' }, { nextAttemptAt: now + 5_000 });
+  const first = makeSender({ outbox, token: 'ctx', now: () => now });
+
+  const r = await first.reply.send('user-1', '新回复', 'ctx');
+  assert.deepStrictEqual(r, { sent: 0, queued: 1 });
+  assert.strictEqual(first.sent.length, 0, '积压未清空时不能直接发送');
+  assert.deepStrictEqual(outbox.list('user-1').map((x) => x.text), ['旧回复', '新回复']);
+
+  // 命令/提示同样不能插队
+  const r2 = await first.reply.sendText('user-1', '提示', 'ctx');
+  assert.deepStrictEqual(r2, { sent: 0, queued: 1 });
+
+  // 到点后严格按入队顺序补发
+  const later = makeSender({ outbox, token: 'ctx', now: () => now + 6_000 });
+  await later.reply.flush('user-1');
+  assert.deepStrictEqual(later.sent.map((x) => x.text), ['旧回复', '新回复', '提示']);
+});
+
+await check('并发 flush 单飞：同一批只发送一次', async () => {
+  const outbox = new MemoryOutbox();
+  outbox.add('user-1', { type: 'text', text: 'A' });
+  outbox.add('user-1', { type: 'text', text: 'B' });
+  const sent = [];
+  const { reply } = makeSender({
+    outbox,
+    token: 'ctx',
+    ilink: {
+      sendText: async (o) => {
+        await new Promise((r) => setTimeout(r, 10));
+        sent.push(o.text);
+        return { ret: 0 };
+      },
+    },
+  });
+
+  await Promise.all([reply.flush('user-1'), reply.flush('user-1')]);
+  assert.deepStrictEqual(sent, ['A', 'B']);
+});
+
+await check('persist() 等待待发队列落盘', async () => {
+  const outbox = new MemoryOutbox();
+  let flushes = 0;
+  outbox.flush = async () => { flushes += 1; return true; };
+  const { reply } = makeSender({ outbox });
+
+  await reply.persist();
+  assert.strictEqual(flushes, 1);
+});
+
 server.close();
 await rm(root, { recursive: true, force: true });
 console.log(`\n${pass} 通过 / ${fail} 失败`);

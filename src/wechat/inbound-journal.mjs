@@ -249,7 +249,7 @@ export class InboundJournal {
         }
         const receivedAt = Number.isFinite(entry.receivedAt) ? entry.receivedAt : this.now();
         // 交给调用方（流水线）的条目保留原始消息：本轮的 context_token 是回复凭据，
-        // 流水线要靠它刷新会话 token。只有持久化副本才剥掉（D7）。
+        // 流水线要靠它刷新会话 token。只有持久化副本才剥掉。
         const item = { id, receivedAt, weak: entry.weak === true, msg: entry.msg };
         const stored = { ...item, msg: stripContextToken(entry.msg) };
         pending.push(stored);

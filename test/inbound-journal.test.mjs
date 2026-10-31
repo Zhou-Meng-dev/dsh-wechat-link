@@ -16,18 +16,9 @@ import {
   stripContextToken,
 } from '../src/wechat/inbound-journal.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 const root = await mkdtemp(join(tmpdir(), 'inbound-journal-'));
 const mode = async (p) => (await stat(p)).mode & 0o777;
@@ -255,5 +246,4 @@ await check('isFull 是软上限', async () => {
 
 await rm(root, { recursive: true, force: true });
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

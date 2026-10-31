@@ -18,18 +18,9 @@ import { OutboxStore } from '../src/wechat/outbox.mjs';
 import { DlqStore } from '../src/wechat/dlq.mjs';
 import { ReplySender } from '../src/wechat/reply.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -185,7 +176,7 @@ await check('永久错误：进 DLQ 并给 owner 发节流告警', async () => {
   onSend = (msg) => {
     const text = String(msg.item_list?.[0]?.text_item?.text ?? '');
     // 只让用户消息失败；DLQ 告警本身必须能送达
-    if (text === '坏消息' || text === '坏消息2') {
+    if (text === '坏消息' || text === '坏消息2' || text === '坏消息3') {
       return { status: 400, body: { ret: -2, errmsg: 'bad request' } };
     }
     return { status: 200, body: { ret: 0 } };
@@ -211,8 +202,18 @@ await check('永久错误：进 DLQ 并给 owner 发节流告警', async () => {
   t.reply = t.createReplySender();
   await t.reply.send('user-1', '坏消息2', 'ctx-new');
   await sleep(50);
-  assert.strictEqual(sends.filter((s) => String(s.msg.item_list?.[0]?.text_item?.text ?? '').includes('放弃')).length, 1);
+  const notices = () => sends.filter((s) => String(s.msg.item_list?.[0]?.text_item?.text ?? '').includes('放弃'));
+  assert.strictEqual(notices().length, 1);
   assert.ok(sends.length >= before);
+
+  // 窗口过后：把积压的失败条数汇总成一条「N 条」告警，而不是逐条打扰
+  const clock = { now: Date.now() + 10 * 60_000 };
+  t.noticeThrottle.now = () => clock.now;
+  t.reply = t.createReplySender();
+  await t.reply.send('user-1', '坏消息3', 'ctx-new');
+  await sleep(50);
+  assert.strictEqual(notices().length, 2, '窗口过后应再发一条汇总');
+  assert.match(String(notices()[1].msg.item_list[0].text_item.text), /2 条消息发送失败/);
 });
 
 await check('token 失效：保留在 outbox，attempts 不增长', async () => {
@@ -257,5 +258,4 @@ await check('媒体失败后，文字一并入队（严格保序）', async () =
 for (const root of roots) await rm(root, { recursive: true, force: true });
 server.close();
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

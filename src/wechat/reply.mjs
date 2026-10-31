@@ -82,6 +82,18 @@ export class ReplySender {
     this.sleep = sleep;
     this.random = random;
     this.maxFlushItems = maxFlushItems;
+    /** 每个 peer 同一时刻只允许一个 flush，避免定时器与入站同时补发同一条 */
+    this.flushByPeer = new Map();
+  }
+
+  /** 该 peer 是否还有未送达的积压（新回复必须排在后面）。 */
+  hasPending(peerId) {
+    return (this.outbox?.list(peerId).length ?? 0) > 0;
+  }
+
+  /** 等待已入队消息落盘；回合结束提交入站日志前调用。 */
+  async persist() {
+    await this.outbox?.flush().catch(() => {});
   }
 
   /**
@@ -93,6 +105,14 @@ export class ReplySender {
    */
   async send(toUserId, text, contextToken) {
     const { text: rawBody, media } = extractMediaDirectives(text);
+
+    // 该用户还有积压时，先尝试补发；仍没清空就把新回复排在后面，
+    // 否则会越过退避中的旧消息。
+    if (this.hasPending(toUserId)) {
+      await this.flush(toUserId).catch(() => {});
+      if (this.hasPending(toUserId)) return this.#queueBehindBacklog(toUserId, rawBody, media);
+    }
+
     const notes = [];
     let sentMedia = 0;
     let queuedMedia = 0;
@@ -125,22 +145,12 @@ export class ReplySender {
           toUserId,
         });
       } catch (err) {
-        const kindOfError = classifySendError(err);
-        notes.push(`${label}「${filePath}」发送失败：${err.message}`);
-        this.log(`${kind === 'image' ? '🖼' : '📎'} ${label}上传失败 ${filePath}: ${err.message}`);
-        if (kindOfError === 'permanent') {
-          this.#recordDlq(toUserId, { type: 'media-file', kind, filePath }, err.message, 0);
-          continue;
+        const outcome = this.#handleUploadFailure({ toUserId, kind, filePath, err, notes });
+        if (outcome === 'queued') {
+          // 已入队：后续媒体也按顺序入队，否则补发顺序会乱
+          queuedMedia++;
+          queueRest = true;
         }
-        // 可重试：存 media-file，补发时重新上传（会再过一次 workspace 白名单）
-        this.#queueOutbound(
-          toUserId,
-          { type: 'media-file', kind, filePath },
-          `上传失败：${err.message}`,
-          { attempts: 1, nextAt: this.#nextAt(1) },
-        );
-        queuedMedia++;
-        queueRest = true;
         continue;
       }
 
@@ -245,21 +255,58 @@ export class ReplySender {
   }
 
   /**
+   * 已有积压时把整条回复排队：媒体存 media-file（补发时重新上传），文字按分段排队。
+   * 这里不上传、不发送，避免越过积压。
+   */
+  #queueBehindBacklog(peerId, rawBody, media) {
+    let queued = 0;
+    for (const item of media.slice(0, MAX_MEDIA_PER_REPLY)) {
+      this.#queueOutbound(
+        peerId,
+        { type: 'media-file', kind: item.kind, filePath: item.path },
+        '等待前序消息补发',
+        { quiet: true },
+      );
+      queued += 1;
+    }
+    const body = markdownToPlainText(rawBody).trim();
+    if (body) queued += this.queueTextBody(peerId, body);
+    return { sent: 0, queued };
+  }
+
+  /**
    * 发送纯文本（内置命令回复 / 提示复用）。
    * 与 send() 使用同一套分类、原地重试与入队逻辑，但不再解析媒体指令与 Markdown。
    *
    * @returns {Promise<{sent: number, queued: number}>}
    */
-  sendText(peerId, text, contextToken) {
+  async sendText(peerId, text, contextToken) {
+    if (this.hasPending(peerId)) {
+      await this.flush(peerId).catch(() => {});
+      if (this.hasPending(peerId)) {
+        return { sent: 0, queued: this.queueTextBody(peerId, text) };
+      }
+    }
     return this.#sendTextChunks(peerId, text, contextToken);
   }
 
   /**
    * 用最新的 context_token 补发某个用户的积压消息。
-   * 严格从队首开始：未到 nextAttemptAt 就停，不跳过它去发后面的。
+   * 同一 peer 并发调用会复用同一个进行中的 flush。
    */
   async flush(peerId) {
     if (!this.outbox) return;
+    const running = this.flushByPeer.get(peerId);
+    if (running) return running;
+    const p = this.#flushOnce(peerId).finally(() => this.flushByPeer.delete(peerId));
+    this.flushByPeer.set(peerId, p);
+    return p;
+  }
+
+  /**
+   * 补发实现。严格从队首开始：未到 nextAttemptAt 就停，不跳过它去发后面的。
+   */
+  async #flushOnce(peerId) {
     const queued = this.outbox.list(peerId);
     if (queued.length === 0) return;
 
@@ -290,21 +337,16 @@ export class ReplySender {
         }
 
         const attempts = (item.attempts ?? 0) + 1;
-        if (kind === 'permanent') {
-          // 先把这一次失败计入 attempts，DLQ 摘要才是真实的尝试次数
+        // 永久错误与「重试次数用尽」处理完全一致：先把这一次失败计入 attempts，
+        // DLQ 摘要才是真实的尝试次数；然后移出队列并告警。
+        if (kind === 'permanent' || attempts >= DEFAULT_MAX_ATTEMPTS) {
           this.outbox.markAttempt(peerId, item.seq, { error: summary, nextAt: this.now() });
           this.outbox.moveToDlq(peerId, item.seq, summary);
           this.#notifyDlq(peerId, item, summary, attempts);
-          this.log(`📮 永久错误，已放弃（${item.type}）: ${summary}`);
+          this.log(kind === 'permanent'
+            ? `📮 永久错误，已放弃（${item.type}）: ${summary}`
+            : `📮 已尝试 ${attempts} 次，进入 DLQ: ${summary}`);
           continue; // 队首已移除，继续下一条，剩余顺序不变
-        }
-
-        if (attempts >= DEFAULT_MAX_ATTEMPTS) {
-          this.outbox.markAttempt(peerId, item.seq, { error: summary, nextAt: this.now() });
-          this.outbox.moveToDlq(peerId, item.seq, summary);
-          this.#notifyDlq(peerId, item, summary, attempts);
-          this.log(`📮 已尝试 ${attempts} 次，进入 DLQ: ${summary}`);
-          continue;
         }
 
         const delay = nextAttemptDelay(attempts, { random: this.random });
@@ -343,49 +385,63 @@ export class ReplySender {
       clientId,
     });
 
+    const result = await this.#attemptWithInlineRetry(attempt, {
+      onRetryable: (err) => this.log(
+        `📮 媒体 ${prepared.name} 发送失败（可重试），${RETRY_INLINE_DELAY_MS}ms 后原地重试一次: ${err.message}`,
+      ),
+    });
+
+    if (result.outcome === 'sent') return 'sent';
+
+    if (result.outcome === 'token') {
+      this.#queueOutbound(toUserId, { type: 'media', media: prepared }, 'context_token 失效', { quiet: true, clientId });
+      this.log(`📮 媒体 ${prepared.name} 因 context_token 失效进入待发队列`);
+      return 'queued';
+    }
+
+    if (result.outcome === 'permanent') {
+      this.#recordDlq(toUserId, { type: 'media', media: prepared }, result.err.message, result.round - 1);
+      return 'dropped';
+    }
+
+    this.#queueOutbound(
+      toUserId,
+      { type: 'media', media: prepared },
+      `可重试错误：${result.err.message}`,
+      { attempts: 1, nextAt: this.#nextAt(1), clientId },
+    );
+    this.log(`📮 媒体 ${prepared.name} 进入待发队列，稍后重试`);
+    return 'queued';
+  }
+
+  /**
+   * 一次发送尝试（外加一次原地重试），只做错误分类，不做业务动作。
+   * 媒体与文字的「分类 → 重试 → 入队/DLQ」阶梯共用这一处，避免两份实现漂移。
+   *
+   * @param {() => Promise<unknown>} attempt
+   * @param {{onRetryable?: (err: Error) => void}} [opts]
+   * @returns {Promise<{outcome: 'sent'|'token'|'permanent'|'retryable', err?: Error, round: number}>}
+   *          round 为最后一次尝试是第几次（1=首次，2=原地重试后）
+   */
+  async #attemptWithInlineRetry(attempt, { onRetryable } = {}) {
+    const first = await this.#classifyAttempt(attempt);
+    if (first.outcome !== 'retryable') return { ...first, round: 1 };
+
+    onRetryable?.(first.err);
+    await this.sleep(RETRY_INLINE_DELAY_MS);
+    return { ...(await this.#classifyAttempt(attempt)), round: 2 };
+  }
+
+  /** 跑一次发送并归类：成功 / token 失效 / 永久错误 / 可重试错误。 */
+  async #classifyAttempt(attempt) {
     try {
       await attempt();
-      return 'sent';
+      return { outcome: 'sent' };
     } catch (err) {
       const kind = classifySendError(err);
-
-      if (kind === 'token') {
-        this.#queueOutbound(toUserId, { type: 'media', media: prepared }, 'context_token 失效', { quiet: true, clientId });
-        this.log(`📮 媒体 ${prepared.name} 因 context_token 失效进入待发队列`);
-        return 'queued';
-      }
-
-      if (kind === 'permanent') {
-        this.#recordDlq(toUserId, { type: 'media', media: prepared }, err.message, 0);
-        return 'dropped';
-      }
-
-      // 可重试：原地 500ms 再试一次
-      this.log(`📮 媒体 ${prepared.name} 发送失败（可重试），${RETRY_INLINE_DELAY_MS}ms 后原地重试一次: ${err.message}`);
-      await this.sleep(RETRY_INLINE_DELAY_MS);
-      try {
-        await attempt();
-        return 'sent';
-      } catch (err2) {
-        const kind2 = classifySendError(err2);
-        if (kind2 === 'token') {
-          this.#queueOutbound(toUserId, { type: 'media', media: prepared }, 'context_token 失效', { quiet: true, clientId });
-          this.log(`📮 媒体 ${prepared.name} 因 context_token 失效进入待发队列`);
-          return 'queued';
-        }
-        if (kind2 === 'permanent') {
-          this.#recordDlq(toUserId, { type: 'media', media: prepared }, err2.message, 1);
-          return 'dropped';
-        }
-        this.#queueOutbound(
-          toUserId,
-          { type: 'media', media: prepared },
-          `可重试错误：${err2.message}`,
-          { attempts: 1, nextAt: this.#nextAt(1), clientId },
-        );
-        this.log(`📮 媒体 ${prepared.name} 进入待发队列，稍后重试`);
-        return 'queued';
-      }
+      if (kind === 'permanent') return { outcome: 'permanent', err };
+      if (kind === 'retryable') return { outcome: 'retryable', err };
+      return { outcome: 'token', err };
     }
   }
 
@@ -394,30 +450,43 @@ export class ReplySender {
    * 这样既不会因为一次 token 失效丢掉后续媒体，也不会打乱顺序。
    */
   async #queueMediaFile(toUserId, kind, filePath, notes) {
-    const label = kind === 'image' ? '图片' : '文件';
+    let prepared;
     try {
-      const prepared = await uploadMedia({
+      prepared = await uploadMedia({
         ilink: this.ilink,
         workspace: this.cwd,
         kind,
         filePath,
         toUserId,
       });
-      this.#queueOutbound(toUserId, { type: 'media', media: prepared }, 'context_token 失效', { quiet: true });
     } catch (err) {
-      notes.push(`${label}「${filePath}」发送失败：${err.message}`);
-      this.log(`${kind === 'image' ? '🖼' : '📎'} ${label}上传失败 ${filePath}: ${err.message}`);
-      if (classifySendError(err) === 'permanent') {
-        this.#recordDlq(toUserId, { type: 'media-file', kind, filePath }, err.message, 0);
-        return;
-      }
-      this.#queueOutbound(
-        toUserId,
-        { type: 'media-file', kind, filePath },
-        `上传失败：${err.message}`,
-        { attempts: 1, nextAt: this.#nextAt(1) },
-      );
+      this.#handleUploadFailure({ toUserId, kind, filePath, err, notes });
+      return;
     }
+    this.#queueOutbound(toUserId, { type: 'media', media: prepared }, 'context_token 失效', { quiet: true });
+  }
+
+  /**
+   * 上传失败的统一处理：永久错误进 DLQ，可重试则入队为 media-file，
+   * 补发时重新上传（会再过一次 workspace 白名单，绝不为重试放开任意路径）。
+   *
+   * @returns {'dropped'|'queued'}
+   */
+  #handleUploadFailure({ toUserId, kind, filePath, err, notes }) {
+    const label = kind === 'image' ? '图片' : '文件';
+    notes.push(`${label}「${filePath}」发送失败：${err.message}`);
+    this.log(`${kind === 'image' ? '🖼' : '📎'} ${label}上传失败 ${filePath}: ${err.message}`);
+    if (classifySendError(err) === 'permanent') {
+      this.#recordDlq(toUserId, { type: 'media-file', kind, filePath }, err.message, 0);
+      return 'dropped';
+    }
+    this.#queueOutbound(
+      toUserId,
+      { type: 'media-file', kind, filePath },
+      `上传失败：${err.message}`,
+      { attempts: 1, nextAt: this.#nextAt(1) },
+    );
+    return 'queued';
   }
 
   /**
@@ -469,33 +538,22 @@ export class ReplySender {
    * @returns {Promise<'sent'|'token'|'queued'|'dropped'>}
    */
   async #deliverTextChunk(peerId, text, contextToken, clientId) {
-    try {
-      await this.ilink.sendText({ toUserId: peerId, text, contextToken, clientId });
-      return 'sent';
-    } catch (err) {
-      const kind = classifySendError(err);
-      if (kind === 'token') return 'token';
+    const result = await this.#attemptWithInlineRetry(
+      () => this.ilink.sendText({ toUserId: peerId, text, contextToken, clientId }),
+      {
+        onRetryable: (err) => this.log(
+          `文字发送失败（可重试），${RETRY_INLINE_DELAY_MS}ms 后原地重试一次: ${err.message}`,
+        ),
+      },
+    );
 
-      if (kind === 'permanent') {
-        this.#recordDlq(peerId, { type: 'text', text }, err.message, 0);
-        return 'dropped';
-      }
-
-      this.log(`文字发送失败（可重试），${RETRY_INLINE_DELAY_MS}ms 后原地重试一次: ${err.message}`);
-      await this.sleep(RETRY_INLINE_DELAY_MS);
-      try {
-        await this.ilink.sendText({ toUserId: peerId, text, contextToken, clientId });
-        return 'sent';
-      } catch (err2) {
-        const kind2 = classifySendError(err2);
-        if (kind2 === 'token') return 'token';
-        if (kind2 === 'permanent') {
-          this.#recordDlq(peerId, { type: 'text', text }, err2.message, 1);
-          return 'dropped';
-        }
-        return 'queued';
-      }
+    if (result.outcome === 'sent') return 'sent';
+    if (result.outcome === 'token') return 'token';
+    if (result.outcome === 'permanent') {
+      this.#recordDlq(peerId, { type: 'text', text }, result.err.message, result.round - 1);
+      return 'dropped';
     }
+    return 'queued';
   }
 
   #queueTextChunks(toUserId, chunks, { reason = 'context_token 失效', attempts = 0, nextAt = 0, clientId = null } = {}) {

@@ -16,18 +16,9 @@ import {
   truncateForModel,
 } from '../src/wechat/limits.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 const root = await mkdtemp(join(tmpdir(), 'limits-'));
 
@@ -141,6 +132,23 @@ await check('每日回合：重启后从 limits.json 恢复', async () => {
   assert.strictEqual((await stat(path)).mode & 0o777, 0o600);
 });
 
+await check('并发 recordTurn 不丢计数（写盘串行化）', async () => {
+  const path = join(root, 'limits-concurrent.json');
+  const now = () => new Date(2026, 9, 31, 12, 0, 0);
+  const counter = new TurnCounter({ path, limit: 10, now });
+  await counter.load();
+
+  await Promise.all([
+    counter.recordTurn('u1'),
+    counter.recordTurn('u1'),
+    counter.recordTurn('u1'),
+  ]);
+
+  const reloaded = new TurnCounter({ path, limit: 10, now });
+  await reloaded.load();
+  assert.deepStrictEqual(reloaded.allow('u1'), { ok: true, used: 3, limit: 10 });
+});
+
 await check('每日回合：上限 0 = 不限，不写盘也能 allow', () => {
   const counter = new TurnCounter({ path: join(root, 'unused.json'), limit: 0, now: () => new Date() });
   for (let i = 0; i < 100; i++) assert.strictEqual(counter.allow('u1').ok, true);
@@ -189,5 +197,4 @@ await check('TenantLimits：默认值与统一入口', async () => {
 
 await rm(root, { recursive: true, force: true });
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

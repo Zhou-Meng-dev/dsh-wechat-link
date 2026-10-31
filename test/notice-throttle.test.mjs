@@ -6,18 +6,9 @@ import assert from 'node:assert/strict';
 
 import { DEFAULT_NOTICE_WINDOW_MS, NoticeThrottle } from '../src/wechat/notice-throttle.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 await check('同一 peer + key 在窗口内只放行一次', () => {
   let now = 0;
@@ -73,5 +64,4 @@ await check('单次调用可覆盖窗口（任务预算提示按每天一次）'
   assert.strictEqual(t.canSend('owner', 'task-budget', { windowMs: DAY }), true);
 });
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

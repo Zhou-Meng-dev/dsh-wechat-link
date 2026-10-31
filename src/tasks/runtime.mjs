@@ -21,6 +21,7 @@ import { mkdir, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { TaskStore, formatNextRun, nextDueDelay, WINDOW_MISSED_GRACE_MS } from './tasks.mjs';
+import { budgetBlocked } from '../ops/budget-guard.mjs';
 import { raceWithTimeout } from '../ops/deadline.mjs';
 import {
   TaskHistory,
@@ -362,10 +363,8 @@ export class TaskRuntime {
     }
     // 预算硬拦截：定时触发与手动 runNow 都受约束，
     // 拒绝时只写历史 + 一条提示，不调用 agent。
-    const budget = this.budgetGuard?.action === 'block'
-      ? this.budgetGuard.canSpend?.(peer)
-      : null;
-    if (budget && budget.ok === false) {
+    const budget = budgetBlocked(this.budgetGuard, peer);
+    if (budget) {
       this.log(`[task] ⛔ 预算已用完（${budget.reason}），跳过「${task.title}」`);
       this.tasks.markRun(task.id, { ok: false, result: 'skipped' });
       await this.#recordTaskRun(task, {

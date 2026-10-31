@@ -23,7 +23,15 @@ import { extractInboundText, formatQuotedContext, isTokenExpiredError } from './
 import { UserMessageQueue, DEFAULT_MERGE_WINDOW_MS } from './message-queue.mjs';
 import { parseBuiltinCommand, renderCommand } from './commands.mjs';
 import { dayKey } from '../ops/usage.mjs';
+import { budgetBlocked } from '../ops/budget-guard.mjs';
 import { TENANT_LIMITS_DEFAULTS } from '../config.mjs';
+
+/**
+ * 「每日回合上限」提示的节流窗口。
+ * 键里已经带了本地日期，窗口取 24h，保证同一个用户当天只被打扰一次
+ * （默认的 5 分钟窗口会让提示每 5 分钟重复一次）。
+ */
+const QUOTA_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export class InboundPipeline {
   /**
@@ -147,6 +155,9 @@ export class InboundPipeline {
   /**
    * 重启后换用新的 iLink / 会话 / 发送器。
    * 队列本身保留，避免 dsh 重启期间已到达的消息被丢掉。
+   *
+   * journal 不在这里换：Tenant 传入的是 `{ commitMany }` 端口（闭包按调用时读
+   * `tenant.journal`），新建 InboundJournal 后 commit 会自动落到新实例。
    */
   rebind({ ilink = this.ilink, conv = this.conv, reply = this.reply } = {}) {
     this.ilink = ilink;
@@ -237,25 +248,14 @@ export class InboundPipeline {
         return;
       }
 
-      const day = this.limits?.allowDay?.(from);
-      if (day && day.ok === false) {
-        this.counters.rejected += 1;
-        this.#noticeOnce(
-          from,
-          `quota-${dayKey(this.now())}`,
-          `📵 今天的回合数已达上限（${day.limit}）。明天再来，或回复 /usage 查看用量。`,
-          contextToken,
-        );
+      if (this.#blockedByQuota(from, contextToken)) {
         await this.#commitJournalId(meta?.journalId);
         return;
       }
 
       // 预算预检（block 模式）：入队前给用户即时反馈；
       // 回合开始前会再查一次，防止排队期间额度被别的回合花完。
-      const budget = this.#budgetBlocked(from);
-      if (budget) {
-        this.counters.budgetBlocked += 1;
-        this.#noticeOnce(from, 'budget', this.#budgetNotice(budget), contextToken);
+      if (this.#blockedByBudget(from, contextToken)) {
         await this.#commitJournalId(meta?.journalId);
         return;
       }
@@ -320,6 +320,13 @@ export class InboundPipeline {
         release?.();
       }
     } finally {
+      // 回复可能刚进入待发队列：先确认落盘，再移除入站日志条目，
+      // 否则进程被 kill 时会出现「日志已 commit、回复只在内存」的丢失窗口。
+      try {
+        await this.reply?.persist?.();
+      } catch {
+        /* 落盘失败时 commit 仍继续：最坏只是重启后重放一次 */
+      }
       await this.#commitItems(items);
     }
   }
@@ -328,28 +335,9 @@ export class InboundPipeline {
   async #runTurn(from, batch) {
     const { text, images: rawImages, files: rawFiles, contextToken } = batch;
 
-    // 回合前再查一次每日配额：排队期间别的回合可能刚把额度用完
-    if (this.limits?.allowDay) {
-      const day = this.limits.allowDay(from);
-      if (day && day.ok === false) {
-        this.counters.rejected += 1;
-        this.#noticeOnce(
-          from,
-          `quota-${dayKey(this.now())}`,
-          `📵 今天的回合数已达上限（${day.limit}）。明天再来，或回复 /usage 查看用量。`,
-          contextToken,
-        );
-        return;
-      }
-    }
-
-    // 回合前再查一次预算：排队期间别的回合可能刚把额度花完
-    const budget = this.#budgetBlocked(from);
-    if (budget) {
-      this.counters.budgetBlocked += 1;
-      this.#noticeOnce(from, 'budget', this.#budgetNotice(budget), contextToken);
-      return;
-    }
+    // 回合前再查一次每日配额与预算：排队期间别的回合可能刚把额度用完
+    if (this.#blockedByQuota(from, contextToken)) return;
+    if (this.#blockedByBudget(from, contextToken)) return;
 
     // 回合计数：合并后的多条消息只算一个回合
     if (this.limits?.recordTurn) {
@@ -434,26 +422,54 @@ export class InboundPipeline {
     await this.#commitItems([{ journalId: id }]);
   }
 
-  /** block 模式下预算不足时返回检查结果；warn 模式永远返回 null。 */
-  #budgetBlocked(peerId) {
-    if (this.budgetGuard?.action !== 'block') return null;
-    const r = this.budgetGuard.canSpend?.(peerId);
-    return r && r.ok === false ? r : null;
+  /**
+   * 每日回合上限：超限时计数并按「每天一次」提示。返回 true 表示已拒绝。
+   * 入队前与回合前各调用一次（排队期间额度可能被别的回合用完）。
+   */
+  #blockedByQuota(peerId, contextToken) {
+    const day = this.limits?.allowDay?.(peerId);
+    if (!day || day.ok !== false) return false;
+    this.counters.rejected += 1;
+    this.#noticeOnce(
+      peerId,
+      `quota-${dayKey(this.now())}`,
+      `📵 今天的回合数已达上限（${day.limit}）。明天再来，或回复 /usage 查看用量。`,
+      contextToken,
+      { windowMs: QUOTA_NOTICE_WINDOW_MS },
+    );
+    return true;
+  }
+
+  /** 预算硬拦截（block 模式）：超限时计数并提示。返回 true 表示已拒绝。 */
+  #blockedByBudget(peerId, contextToken) {
+    const budget = budgetBlocked(this.budgetGuard, peerId);
+    if (!budget) return false;
+    this.counters.budgetBlocked += 1;
+    this.#noticeOnce(peerId, 'budget', this.#budgetNotice(budget), contextToken);
+    return true;
   }
 
   /** 预算拦截文案：给出今日/本月用量与限额，并引导 /usage。 */
   #budgetNotice(check) {
     const label = check.window === 'month' ? '本月' : '今日';
     const who = check.scope === 'user' ? '你的' : '';
-    return `💸 ${who}${label} token 用量已达 ${check.spent}（限额 ${check.limit}），已暂停新回合。回复 /usage 查看明细。`;
+    const s = this.commands?.usage?.summary?.();
+    const day = s?.day?.totalTokens;
+    const month = s?.month?.totalTokens;
+    const totals = Number.isFinite(day) || Number.isFinite(month)
+      ? `；当前今日 ${day ?? 0} / 本月 ${month ?? 0} token`
+      : '';
+    return `💸 ${who}${label} token 用量已达 ${check.spent}（限额 ${check.limit}）${totals}，已暂停新回合。回复 /usage 查看明细。`;
   }
 
   /**
    * 节流提示：同一 peer + key 在窗口内只发一次。
    * 走 ReplySender（token 失效自然进 outbox），发送失败只记日志。
+   *
+   * @param {{windowMs?: number}} [opts] - 覆盖提示窗口（如「每日回合上限」要每天只提示一次）
    */
-  #noticeOnce(peer, key, text, contextToken) {
-    if (this.notice && typeof this.notice.canSend === 'function' && !this.notice.canSend(peer, key)) {
+  #noticeOnce(peer, key, text, contextToken, opts = {}) {
+    if (this.notice && typeof this.notice.canSend === 'function' && !this.notice.canSend(peer, key, opts)) {
       return;
     }
     const send = typeof this.reply?.sendText === 'function'

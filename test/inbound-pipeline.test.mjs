@@ -422,6 +422,24 @@ await check('每日回合上限：拒绝 + 提示（不调用模型）', async (
   h.pipeline.stop();
 });
 
+await check('每日回合上限提示：同一用户每天只发一次（不被 5 分钟默认窗口重复）', async () => {
+  let now = 0;
+  const limits = { ...baseLimits(), allowDay: () => ({ ok: false, used: 5, limit: 5 }) };
+  const h = makeHarness({}, { limits, notice: new NoticeThrottle({ now: () => now }) });
+
+  for (const minutes of [0, 10, 20]) {
+    now = minutes * 60_000;
+    h.pipeline.push(textMsg(`超配额${minutes}`, { from: 'owner', token: 'ctx' }));
+    await sleep(20);
+  }
+  await waitFor(() => h.sends.length >= 1);
+  await sleep(50);
+  assert.strictEqual(h.sends.length, 1, '当天只提示一次');
+  assert.match(h.sends[0].text, /上限（5）/);
+  assert.strictEqual(h.pipeline.stats().rejected, 3, '每条超限消息仍要计数');
+  h.pipeline.stop();
+});
+
 await check('每用户队列满：拒绝最新一条 + 提示，不静默丢', async () => {
   const limits = { ...baseLimits(), queueMaxPerPeer: 1 };
   const h = makeHarness({}, { limits, notice: new NoticeThrottle({ now: () => 0 }) });

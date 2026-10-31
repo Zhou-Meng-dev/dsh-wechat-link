@@ -264,9 +264,13 @@ export class UsageStore extends EventEmitter {
     };
     this.data = { version: VERSION, days: {}, alerts: {}, peers: {} };
     this.dirty = false;
+    /** load() 只读一次：dsh 重启会重跑 start()，不能把内存里未落盘的计数覆盖掉 */
+    this.loaded = false;
   }
 
   async load() {
+    if (this.loaded) return this;
+    this.loaded = true;
     if (!existsSync(this.path)) return this;
     try {
       const raw = JSON.parse(await readFile(this.path, 'utf8'));

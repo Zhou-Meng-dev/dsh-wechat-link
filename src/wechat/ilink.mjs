@@ -117,16 +117,14 @@ export class IlinkClient {
      */
     this.syncBuf = '';
     this.stopped = false;
-    /** 在途请求的 controller，shutdown 时用来中断长轮询 */
-    this.abortController = null;
+    /** 在途请求的 controller（可能同时有长轮询与发送）；关闭时全部中断 */
+    this.controllers = new Set();
   }
 
   async #post(endpoint, body, timeoutMs = DEFAULT_API_TIMEOUT_MS) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
-    // 记录在途 controller，供 abort() 中断（关闭时不再等 35s 长轮询）
-    const previous = this.abortController;
-    this.abortController = ctl;
+    this.controllers.add(ctl);
     try {
       const res = await fetch(this.baseUrl + endpoint, {
         method: 'POST',
@@ -143,8 +141,8 @@ export class IlinkClient {
       }
       return JSON.parse(text);
     } finally {
+      this.controllers.delete(ctl);
       clearTimeout(timer);
-      if (this.abortController === ctl) this.abortController = previous;
     }
   }
 
@@ -156,12 +154,14 @@ export class IlinkClient {
     if (typeof buf === 'string' && buf) this.syncBuf = buf;
   }
 
-  /** 中断在途请求（关闭时使用）。之后的新请求不会被阻止，由调用方状态机控制。 */
+  /** 中断所有在途请求（关闭时使用）。之后的新请求不会被阻止，由调用方状态机控制。 */
   abort() {
-    try {
-      this.abortController?.abort();
-    } catch {
-      /* 已结束的 controller 不需要处理 */
+    for (const ctl of this.controllers) {
+      try {
+        ctl.abort();
+      } catch {
+        /* 已结束的 controller 不需要处理 */
+      }
     }
   }
 

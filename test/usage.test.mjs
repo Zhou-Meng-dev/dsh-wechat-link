@@ -323,6 +323,23 @@ await check('peers 超过上限：按 lastAt 淘汰最旧', () => {
   assert.strictEqual(st.peersSummary().some((x) => x.peerId === 'old'), false);
 });
 
+await check('load() 幂等：二次 load 不覆盖未落盘用量', async () => {
+  const p = join(root, 'idempotent.json');
+  const now = localDate(2026, 10, 30);
+  const st = new UsageStore({ path: p, budget: {}, now: () => now });
+  await st.load();
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 5 } });
+  await st.flush();
+
+  // 落盘后继续记账但不 flush，模拟 dsh 重启时内存比磁盘新
+  st.record({ at: now, peerId: 'u1', usage: { totalTokens: 7 } });
+  const before = st.summary().day.totalTokens;
+  assert.strictEqual(before, 12);
+
+  await st.load();
+  assert.strictEqual(st.summary().day.totalTokens, 12, '二次 load 不能回退到磁盘旧值');
+});
+
 await rm(root, { recursive: true, force: true });
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

@@ -289,6 +289,24 @@ await check('abort() 中断在途长轮询', async () => {
   }
 });
 
+await check('abort() 中断所有在途请求（长轮询 + 发送）', async () => {
+  hangResponses = true;
+  try {
+    const ilink = new IlinkClient({ token: 't', baseUrl: base2 });
+    const poll = ilink.getUpdates(10_000);
+    const send = ilink.sendText({ toUserId: 'u', text: 'x' });
+    setTimeout(() => ilink.abort(), 20);
+
+    const results = await Promise.allSettled([poll, send]);
+    assert.strictEqual(results[0].status, 'rejected');
+    assert.strictEqual(results[1].status, 'rejected');
+    assert.strictEqual(results[0].reason.name, 'AbortError');
+    assert.strictEqual(results[1].reason.name, 'AbortError');
+  } finally {
+    hangResponses = false;
+  }
+});
+
 server2.close();
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

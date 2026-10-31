@@ -13,18 +13,9 @@ import {
   nextAttemptDelay,
 } from '../src/wechat/retry-policy.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 await check('默认基线与上限', () => {
   assert.strictEqual(DEFAULT_RETRY_BASE_MS, 2_000);
@@ -59,5 +50,4 @@ await check('非法 attempts 按 1 处理', () => {
   assert.strictEqual(nextAttemptDelay(NaN, { random: () => 0 }), 2_000);
 });
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

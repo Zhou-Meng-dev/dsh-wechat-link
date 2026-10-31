@@ -17,18 +17,9 @@ import { join } from 'node:path';
 import { Tenant } from '../src/tenant.mjs';
 import { InboundJournal } from '../src/wechat/inbound-journal.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(predicate, timeoutMs = 5000, label = '条件') {
@@ -250,6 +241,35 @@ await check('未授权消息被拒绝后从 pending 移除（不无限重放）'
   await t.stop();
 });
 
+// ---------------------------------------------------------------- 5.1 同一实例二次 start
+
+await check('dsh 重启（同一 Tenant 二次 start）后游标继续前进，不丢 pending', async () => {
+  const root = await newRoot('inplace');
+  const logs = [];
+  const asks = [];
+  current = { buf: 'y1', msgs: [textMsg('y1', '重启前')] };
+
+  const t = await makeTenant(root, logs, asks);
+  await t.start();
+  await waitFor(() => asks.length === 1, 5000, '重启前回合');
+  await sleep(100);
+
+  // dsh 子进程退出 → state='failed' → start()：流水线与队列复用，
+  // 但 journal 是新建实例；commit 必须落到新实例，否则游标会回退。
+  t.state = 'failed';
+  current = { buf: 'y2', msgs: [textMsg('y2', '重启后')] };
+  await t.start();
+  await waitFor(() => asks.length === 2, 5000, '重启后回合');
+  await sleep(150);
+
+  const sync = await readSync(root);
+  console.log('DEBUG sync=', JSON.stringify(sync));
+  assert.strictEqual(sync.cursor, 'y2', '二次 start() 后游标必须继续前进');
+  assert.deepStrictEqual(sync.pending, [], '已处理的 pending 必须清空');
+  assert.deepStrictEqual(sync.processed.sort(), ['m:y1', 'm:y2']);
+  await t.stop();
+});
+
 // ---------------------------------------------------------------- 6. 一批多条
 
 await check('一批多条消息：合并成一次回合，重复投递不重复', async () => {
@@ -307,5 +327,4 @@ await check('入站 context_token 写入会话并用于回复', async () => {
 for (const root of roots) await rm(root, { recursive: true, force: true });
 server.close();
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

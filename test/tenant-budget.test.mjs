@@ -17,18 +17,9 @@ import { IlinkClient } from '../src/wechat/ilink.mjs';
 import { OutboxStore } from '../src/wechat/outbox.mjs';
 import { DlqStore } from '../src/wechat/dlq.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(predicate, timeoutMs = 5000, label = '条件') {
@@ -206,5 +197,4 @@ await check('租户月预算同样生效', async () => {
 for (const root of roots) await rm(root, { recursive: true, force: true });
 server.close();
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();

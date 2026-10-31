@@ -23,7 +23,8 @@ import { NoticeThrottle } from './wechat/notice-throttle.mjs';
 import { ReplySender } from './wechat/reply.mjs';
 import { MediaIngest } from './wechat/ingest.mjs';
 import { InboundPipeline } from './wechat/inbound.mjs';
-import { InboundJournal, inboundFieldNames, inboundMessageKey } from './wechat/inbound-journal.mjs';
+import { InboundJournal } from './wechat/inbound-journal.mjs';
+import { createInboundPoller } from './wechat/inbound-poller.mjs';
 import { TenantLimits } from './wechat/limits.mjs';
 import { Semaphore } from './wechat/semaphore.mjs';
 import { LinkIngest } from './wechat/links.mjs';
@@ -33,10 +34,14 @@ import { UsageStore } from './ops/usage.mjs';
 
 const STARTUP_RETRY_MS = 3_000;
 const MAX_STARTUP_RETRIES = 5;
+/** 用量定时落盘：进程被硬杀时最多丢这个窗口的计数 */
+const USAGE_FLUSH_INTERVAL_MS = 30_000;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Tenant extends EventEmitter {
+  /** 节流窗口内已放弃、还没汇总进告警的 DLQ 条数 */
+  #dlqPending = 0;
+
   /**
    * @param {object} tenant - resolveTenant() 合并后的运行时视图
    *   （config + secrets + persona 文件，已含派生值）
@@ -89,6 +94,8 @@ export class Tenant extends EventEmitter {
       if (this.stopped) return;
       this.#log(`❌ dsh 子进程退出 (code=${code}, signal=${signal})，尝试重启`);
       this.state = 'failed';
+      // 先把用量落盘；start() 会重新跑一遍，不能让内存计数被磁盘旧值覆盖
+      this.usage.flush().catch(() => {});
       this.#scheduleRestart();
     });
 
@@ -110,6 +117,8 @@ export class Tenant extends EventEmitter {
     this.semaphore = null;
     /** 出站重试定时器（30s，unref） */
     this.retryTimer = null;
+    /** 用量定时落盘（30s，unref） */
+    this.usageTimer = null;
     /** 提示节流：DLQ 告警、限流提示、预算提示共用 */
     this.noticeThrottle = new NoticeThrottle();
     /** @type {ReplySender|null} 出站发送（媒体/分段/待发队列），start() 或测试装配点创建 */
@@ -220,6 +229,7 @@ export class Tenant extends EventEmitter {
 
       // 用量统计：先加载历史，保证重启后日/月汇总连续
       await this.usage.load();
+      this.#startUsageTimer();
       const todayTurns = this.usage.dayBucket().turns;
       if (todayTurns > 0) this.#log(`今日已累计 ${todayTurns} 个回合的用量`);
 
@@ -316,7 +326,7 @@ export class Tenant extends EventEmitter {
       this.#log(`✅ 已启动 (cwd=${cwd})`);
       this.emit('running');
 
-      this.#pollLoop();
+      this.#startPolling();
     } catch (err) {
       this.state = 'failed';
       this.#log(`❌ 启动失败: ${err.message}`);
@@ -348,93 +358,32 @@ export class Tenant extends EventEmitter {
     this.restartTimer.unref?.();
   }
 
-  async #pollLoop() {
-    let backoff = 1000;
-    let anonSeq = 0;
-    let idProbeLogged = false;
-    while (!this.stopped && this.state === 'running') {
-      // pending 满时反压轮询，而不是丢消息：服务端会保留未拉取的消息。
-      if (this.journal?.isFull()) {
-        await sleep(500);
-        continue;
-      }
-
-      let resp;
-      try {
-        resp = await this.ilink.getUpdates();
-      } catch (err) {
-        // 关闭中：不要用一个 15s 的退避吃掉整个关闭预算
-        if (this.state !== 'running') break;
-        // 长轮询超时属正常
-        backoff = Math.min(backoff * 2, 15_000);
-        await sleep(backoff);
-        continue;
-      }
-      backoff = 1000;
-
-      // 会话失效
-      if (resp.errcode === -14) {
-        this.#log('❌ 登录已失效（errcode -14），本租户停止。请重新扫码添加。');
+  /** 起长轮询。轮询本身不变量多、与租户装配无关，拆在 inbound-poller.mjs。 */
+  #startPolling() {
+    this.poller = createInboundPoller({
+      ilink: this.ilink,
+      journal: this.journal,
+      inbound: this.inbound,
+      log: (m) => this.#log(m),
+      isRunning: () => !this.stopped && this.state === 'running',
+      onExpired: () => {
         this.state = 'stopped';
         this.emit('expired');
-        return;
-      }
-
-      const msgs = Array.isArray(resp.msgs) ? resp.msgs : [];
-      // 诊断：确认去重 id 的字段名（只打印字段名，不打内容），每条连接一次
-      if (!idProbeLogged && msgs.length > 0 && process.env.BRIDGE_DEBUG_INBOUND_IDS === '1') {
-        idProbeLogged = true;
-        this.#log(`🔍 入站消息字段名（诊断用）: ${inboundFieldNames(msgs[0]).join(', ')}`);
-      }
-      if (!this.journal) {
-        // 理论上 start() 一定会装配 journal；退化路径保持旧行为，不阻塞收消息
-        this.ilink.advanceCursor(resp.get_updates_buf);
-        for (const msg of msgs) this.inbound.push(msg);
-        continue;
-      }
-
-      if (msgs.length === 0
-        && (!resp.get_updates_buf || resp.get_updates_buf === this.journal.cursor)) {
-        continue;
-      }
-
-      const entries = [];
-      let anon = 0;
-      for (const msg of msgs) {
-        const key = inboundMessageKey(msg);
-        let id = key.id;
-        if (!id) {
-          anonSeq += 1;
-          id = `anon-${Date.now().toString(36)}-${anonSeq}`;
-          anon += 1;
-        }
-        entries.push({ id, msg, weak: key.strength === 'weak' });
-      }
-      if (anon > 0) {
-        this.#log(`⚠️ ${anon} 条消息缺少可用 id，无法可靠去重（已按一次性 id 处理）`);
-      }
-
-      let admitted;
-      try {
-        // 先落盘游标 + 待处理消息；这一步成功之前游标绝不前进
-        admitted = await this.journal.admit(resp.get_updates_buf, entries);
-      } catch (err) {
-        if (this.state !== 'running') break;
-        // 写盘失败（磁盘满等）：内存游标不前进，退避后重试同一批
-        backoff = Math.min(backoff * 2, 15_000);
-        this.#log(`❌ 入站日志写盘失败（游标未推进，${backoff}ms 后重试）: ${err.message}`);
-        await sleep(backoff);
-        continue;
-      }
-
-      this.ilink.advanceCursor(resp.get_updates_buf);
-      for (const entry of admitted.accepted) {
-        this.inbound.push(entry.msg, { journalId: entry.id });
-      }
-    }
+      },
+      debugInboundIds: process.env.BRIDGE_DEBUG_INBOUND_IDS === '1',
+    });
+    this.poller.run();
   }
 
   // ---------------------------------------------------------------- 出站重试
+
+  #startUsageTimer() {
+    if (this.usageTimer) return;
+    this.usageTimer = setInterval(() => {
+      this.usage.flush().catch((err) => this.#log(`用量落盘失败: ${err.message}`));
+    }, USAGE_FLUSH_INTERVAL_MS);
+    this.usageTimer.unref?.();
+  }
 
   #startRetryTimer() {
     if (this.retryTimer) return;
@@ -460,17 +409,24 @@ export class Tenant extends EventEmitter {
     }
   }
 
-  /** 一条消息被放弃：刷 DLQ、按节流给 owner 发一条汇总。 */
+  /**
+   * 一条消息被放弃：刷 DLQ，并按节流给 owner 发一条「N 条」汇总。
+   * 节流窗口内的失败会累积到下一次告警里，不逐条打扰用户。
+   */
   async #onDlq({ peerId, reason, attempts }) {
     this.#log(`⚠️ [${peerId.slice(0, 12)}…] 消息进入 DLQ: ${String(reason ?? '').slice(0, 100)}`);
     await this.dlq?.flush().catch(() => {});
+    this.#dlqPending += 1;
 
     const owner = this.tenant.ownerId;
     if (!owner) return;
     if (!this.noticeThrottle.canSend(owner, 'dlq')) return;
 
+    const count = this.#dlqPending;
+    this.#dlqPending = 0;
     const token = this.session?.getToken?.(owner);
-    const text = `⚠️ 有消息发送失败已被放弃${attempts ? `（尝试 ${attempts} 次）` : ''}。回复 /status 查看待发队列。`;
+    const retried = attempts ? `（最后一次尝试 ${attempts} 次）` : '';
+    const text = `⚠️ ${count} 条消息发送失败，已放弃${retried}，详见日志。回复 /status 查看待发队列。`;
     try {
       // 直接走 ilink：告警自身失败只记日志，绝不再入队（防止循环）
       await this.ilink?.sendText?.({ toUserId: owner, text, contextToken: token });
@@ -507,6 +463,7 @@ export class Tenant extends EventEmitter {
     this.stopped = true;
     this.state = 'stopping';
     if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
+    if (this.usageTimer) { clearInterval(this.usageTimer); this.usageTimer = null; }
 
     const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
     const remaining = () => Math.max(0, deadline - Date.now());

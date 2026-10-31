@@ -12,18 +12,9 @@ import {
   shutdownTimeoutMs,
 } from '../src/ops/shutdown.mjs';
 
-let pass = 0;
-let fail = 0;
-async function check(desc, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${desc}`);
-    pass++;
-  } catch (err) {
-    console.log(`❌ ${desc}\n   ${err.message}`);
-    fail++;
-  }
-}
+import { createChecker } from './helpers/check.mjs';
+
+const { check, done } = createChecker();
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
@@ -179,5 +170,4 @@ await check('缺 stopAll 时显式报错', () => {
   assert.throws(() => createShutdownController({}), /stopAll/);
 });
 
-console.log(`\n${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+done();
