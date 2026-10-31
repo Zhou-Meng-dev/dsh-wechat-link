@@ -290,6 +290,122 @@ await check('resolveTenant 默认值补全', async () => {
   assert.strictEqual(t.botId, 'x@im.bot');
 });
 
+await check('resolveTenant 新配置默认值 = 现状行为', async () => {
+  const t = resolveTenant({
+    configEntry: { id: 't-x' },
+    secretEntry: { token: 'x@im.bot:0600' },
+    personaText: '',
+    id: 't-x',
+  });
+  assert.strictEqual(t.budgetAction, 'warn');
+  assert.strictEqual(t.perUserBudgetTokensPerDay, undefined);
+  assert.strictEqual(t.perUserBudgetTokensPerMonth, undefined);
+  assert.strictEqual(t.queueMaxPerPeer, 20);
+  assert.strictEqual(t.perUserRatePerMinute, 20);
+  assert.strictEqual(t.perUserTurnsPerDay, 0);
+  assert.strictEqual(t.maxConcurrentTurns, 4);
+  assert.strictEqual(t.maxMessageChars, 8000);
+});
+
+await check('新配置字段可写可读（v2 结构不变）', async () => {
+  const { cfgPath, store } = await freshCase();
+  await store.write({
+    version: 2,
+    tenants: [{
+      id: 't-limits',
+      budgetAction: 'block',
+      perUserBudgetTokensPerDay: 10_000,
+      perUserBudgetTokensPerMonth: 200_000,
+      queueMaxPerPeer: 5,
+      perUserRatePerMinute: 3,
+      perUserTurnsPerDay: 10,
+      maxConcurrentTurns: 2,
+      maxMessageChars: 1000,
+    }],
+  });
+  const cfg = await store.read();
+  const entry = cfg.tenants[0];
+  assert.strictEqual(cfg.version, 2);
+  assert.strictEqual(entry.budgetAction, 'block');
+  assert.strictEqual(entry.perUserBudgetTokensPerDay, 10_000);
+  assert.strictEqual(entry.perUserBudgetTokensPerMonth, 200_000);
+  assert.strictEqual(entry.queueMaxPerPeer, 5);
+  assert.strictEqual(entry.perUserRatePerMinute, 3);
+  assert.strictEqual(entry.perUserTurnsPerDay, 10);
+  assert.strictEqual(entry.maxConcurrentTurns, 2);
+  assert.strictEqual(entry.maxMessageChars, 1000);
+
+  const raw = JSON.parse(await readFile(cfgPath, 'utf8'));
+  assert.strictEqual(raw.version, 2);
+  assert.strictEqual(raw.tenants[0].budgetAction, 'block');
+});
+
+await check('默认值不落盘（warn / 20 / 4 / 8000）', async () => {
+  const { cfgPath, store } = await freshCase();
+  await store.write({
+    version: 2,
+    tenants: [{
+      id: 't-defaults',
+      budgetAction: 'warn',
+      queueMaxPerPeer: 20,
+      perUserRatePerMinute: 20,
+      perUserTurnsPerDay: 0,
+      maxConcurrentTurns: 4,
+      maxMessageChars: 8000,
+    }],
+  });
+  const raw = JSON.parse(await readFile(cfgPath, 'utf8'));
+  const entry = raw.tenants[0];
+  assert.strictEqual(entry.budgetAction, undefined);
+  assert.strictEqual(entry.queueMaxPerPeer, undefined);
+  assert.strictEqual(entry.perUserRatePerMinute, undefined);
+  assert.strictEqual(entry.perUserTurnsPerDay, undefined);
+  assert.strictEqual(entry.maxConcurrentTurns, undefined);
+  assert.strictEqual(entry.maxMessageChars, undefined);
+});
+
+await check('budgetAction 非法值启动时报错，不静默降级', async () => {
+  assert.throws(
+    () => normalizeConfig({ version: 2, tenants: [{ id: 't-x', budgetAction: 'downgrade' }] }),
+    /budgetAction.*downgrade/,
+  );
+  assert.throws(
+    () => resolveTenant({
+      configEntry: { id: 't-x', budgetAction: 'nope' },
+      secretEntry: { token: 'x@im.bot:0600' },
+    }),
+    /budgetAction/,
+  );
+});
+
+await check('数值字段超出区间按边界裁剪，非数字用默认值', async () => {
+  const cfg = normalizeConfig({
+    version: 2,
+    tenants: [{
+      id: 't-clamp',
+      queueMaxPerPeer: 0,
+      perUserRatePerMinute: 999_999,
+      perUserTurnsPerDay: 2_000_000,
+      maxConcurrentTurns: 1000,
+      maxMessageChars: Number.NaN,
+    }],
+  });
+  const e = cfg.tenants[0];
+  assert.strictEqual(e.queueMaxPerPeer, 1);
+  assert.strictEqual(e.perUserRatePerMinute, 10_000);
+  assert.strictEqual(e.perUserTurnsPerDay, 1_000_000);
+  assert.strictEqual(e.maxConcurrentTurns, 64);
+  // NaN 视为"未设置"，落到默认值而不是写 0 或 NaN
+  assert.strictEqual(e.maxMessageChars, undefined);
+  const t = resolveTenant({
+    configEntry: e,
+    secretEntry: { token: 'x@im.bot:0600' },
+    id: 't-clamp',
+  });
+  assert.strictEqual(t.queueMaxPerPeer, 1);
+  assert.strictEqual(t.maxMessageChars, 8000);
+});
+
 // ---------------------------------------------------------------- secrets 存储
 
 await check('SecretsStore 全空时删除文件', async () => {

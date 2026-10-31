@@ -48,6 +48,36 @@ export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
 export const CONFIG_VERSION = 2;
 export const SECRETS_VERSION = 1;
 
+/**
+ * 预算超限后的行为。
+ *   warn  - 发一条提醒，继续调用模型
+ *   block - 拒绝新回合
+ * 「downgrade」暂不支持：需要在单次调用上覆盖模型。
+ */
+export const BUDGET_ACTIONS = ['warn', 'block'];
+export const DEFAULT_BUDGET_ACTION = 'warn';
+
+/**
+ * 租户级输入上限的默认值。
+ * 尽量贴近旧行为：单用户低频对话不变；速率/队列/截断对高流量用户是新增约束。
+ */
+export const TENANT_LIMITS_DEFAULTS = Object.freeze({
+  queueMaxPerPeer: 20,
+  perUserRatePerMinute: 20,
+  perUserTurnsPerDay: 0,
+  maxConcurrentTurns: 4,
+  maxMessageChars: 8000,
+});
+
+/** 每个数值字段的合法区间（超出按边界裁剪，不静默丢弃） */
+const LIMIT_RANGES = {
+  queueMaxPerPeer: [1, 10_000],
+  perUserRatePerMinute: [1, 10_000],
+  perUserTurnsPerDay: [0, 1_000_000],
+  maxConcurrentTurns: [1, 64],
+  maxMessageChars: [1, 200_000],
+};
+
 // ---------------------------------------------------------------- 基础工具
 
 function isObject(x) {
@@ -242,6 +272,35 @@ function isDefaultBaseUrl(url) {
   return trimStr(url).replace(/\/+$/, '') === DEFAULT_BASE_URL;
 }
 
+/** 有限数字按整数区间裁剪；非数字返回 null（表示「未设置」） */
+function clampInt(value, min, max) {
+  if (!Number.isFinite(value)) return null;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+/** 正数字段（token 配额等）：0 / 负数 / 非数字都视为未设置 */
+function positiveInt(value) {
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+/**
+ * budgetAction 只接受枚举；非法值必须启动时报错，不能静默降级成 warn。
+ * @param {unknown} value
+ * @param {string} id - 用于错误信息定位租户
+ * @returns {'warn'|'block'|null}
+ */
+function normalizeBudgetAction(value, id) {
+  const action = trimStr(value);
+  if (!action) return null;
+  if (!BUDGET_ACTIONS.includes(action)) {
+    throw new Error(
+      `租户 ${id} 的 budgetAction 非法：「${action}」。只支持 ${BUDGET_ACTIONS.join(' / ')}。`,
+    );
+  }
+  return action;
+}
+
 // ---------------------------------------------------------------- 归一化
 
 /**
@@ -297,6 +356,22 @@ function configEntryFrom(src) {
   }
   if (Number.isFinite(src.budgetTokensPerMonth) && src.budgetTokensPerMonth > 0) {
     entry.budgetTokensPerMonth = src.budgetTokensPerMonth;
+  }
+
+  // 预算超限行为：warn（默认，不落盘）/ block
+  const budgetAction = normalizeBudgetAction(src.budgetAction, id);
+  if (budgetAction && budgetAction !== DEFAULT_BUDGET_ACTION) entry.budgetAction = budgetAction;
+
+  // 每用户 token 配额：未设置 = 不限
+  const perUserDay = positiveInt(src.perUserBudgetTokensPerDay);
+  if (perUserDay !== null) entry.perUserBudgetTokensPerDay = perUserDay;
+  const perUserMonth = positiveInt(src.perUserBudgetTokensPerMonth);
+  if (perUserMonth !== null) entry.perUserBudgetTokensPerMonth = perUserMonth;
+
+  // 输入上限：默认值不落盘，显式设置才写
+  for (const [key, [min, max]] of Object.entries(LIMIT_RANGES)) {
+    const v = clampInt(src[key], min, max);
+    if (v !== null && v !== TENANT_LIMITS_DEFAULTS[key]) entry[key] = v;
   }
 
   return entry;
@@ -386,6 +461,21 @@ export function resolveTenant({ configEntry, secretEntry, personaText, id } = {}
     ackDelayMs: Number.isFinite(cfg.ackDelayMs) ? cfg.ackDelayMs : undefined,
     budgetTokensPerDay: Number.isFinite(cfg.budgetTokensPerDay) ? cfg.budgetTokensPerDay : undefined,
     budgetTokensPerMonth: Number.isFinite(cfg.budgetTokensPerMonth) ? cfg.budgetTokensPerMonth : undefined,
+    // 预算硬拦截：默认 warn = 只提醒
+    budgetAction: normalizeBudgetAction(cfg.budgetAction, tid) || DEFAULT_BUDGET_ACTION,
+    perUserBudgetTokensPerDay: positiveInt(cfg.perUserBudgetTokensPerDay) ?? undefined,
+    perUserBudgetTokensPerMonth: positiveInt(cfg.perUserBudgetTokensPerMonth) ?? undefined,
+    // 输入上限：未配置时用默认值（= 尽量不改变现状）
+    queueMaxPerPeer: clampInt(cfg.queueMaxPerPeer, ...LIMIT_RANGES.queueMaxPerPeer)
+      ?? TENANT_LIMITS_DEFAULTS.queueMaxPerPeer,
+    perUserRatePerMinute: clampInt(cfg.perUserRatePerMinute, ...LIMIT_RANGES.perUserRatePerMinute)
+      ?? TENANT_LIMITS_DEFAULTS.perUserRatePerMinute,
+    perUserTurnsPerDay: clampInt(cfg.perUserTurnsPerDay, ...LIMIT_RANGES.perUserTurnsPerDay)
+      ?? TENANT_LIMITS_DEFAULTS.perUserTurnsPerDay,
+    maxConcurrentTurns: clampInt(cfg.maxConcurrentTurns, ...LIMIT_RANGES.maxConcurrentTurns)
+      ?? TENANT_LIMITS_DEFAULTS.maxConcurrentTurns,
+    maxMessageChars: clampInt(cfg.maxMessageChars, ...LIMIT_RANGES.maxMessageChars)
+      ?? TENANT_LIMITS_DEFAULTS.maxMessageChars,
   };
 }
 
