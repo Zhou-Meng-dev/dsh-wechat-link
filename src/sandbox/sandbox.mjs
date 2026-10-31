@@ -47,12 +47,18 @@ export const SANDBOX_ENV_PASSTHROUGH = Object.freeze([
   'SSL_CERT_FILE',
   'SSL_CERT_DIR',
   'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
   // 非凭据的 dsh 运行偏好
   'DEEPSEEK_BASE_URL',
   'DSH_TELEMETRY_DISABLED',
   'DSH_WEB_FETCH_PROVIDER',
   'DSH_WEB_SEARCH_PROVIDER',
   'DSH_BUNDLED_SKILL_DIR',
+  // 任务/OCR 脚本读取的既有变量（不含凭据）
+  'BRIDGE_OCR_LANG',
+  'TASKCTL_TIMEOUT',
+  'QUIZ_STATE',
 ]);
 
 /** 由 bwrap 固定设置、不允许被透传或 extra 覆盖的变量 */

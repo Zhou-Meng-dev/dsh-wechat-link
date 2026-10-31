@@ -117,3 +117,15 @@ test('sandboxEnvFrom：显式透传生效，但 HOME/DSH_HOME 等保留变量不
   assert.strictEqual('HOME' in out, false);
   assert.strictEqual('DSH_HOME' in out, false);
 });
+
+test('sandboxEnvFrom：保留任务/OCR 脚本读取的既有变量', () => {
+  const out = sandboxEnvFrom({
+    BRIDGE_OCR_LANG: 'chi_sim+eng',
+    TASKCTL_TIMEOUT: '5',
+    QUIZ_STATE: '/tmp/quiz.json',
+  });
+
+  assert.strictEqual(out.BRIDGE_OCR_LANG, 'chi_sim+eng');
+  assert.strictEqual(out.TASKCTL_TIMEOUT, '5');
+  assert.strictEqual(out.QUIZ_STATE, '/tmp/quiz.json');
+});
