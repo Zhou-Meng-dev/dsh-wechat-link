@@ -60,6 +60,7 @@ export class UserMessageQueue {
    * @param {number} [opts.windowMs] - 合并窗口
    * @param {number} [opts.maxWaitMs] - 最长等待（防止连续输入饿死）
    * @param {(peerId: string, batch: object, items: object[]) => Promise<void> | void} opts.handle
+   * @param {number} [opts.maxPerPeer] - 每用户待处理条数上限（不传 = 不限）
    * @param {(msg: string) => void} [opts.log]
    */
   constructor(opts = {}) {
@@ -68,9 +69,20 @@ export class UserMessageQueue {
       ? Math.max(this.windowMs, opts.maxWaitMs)
       : Math.max(this.windowMs, DEFAULT_MAX_WAIT_MS);
     this.handle = opts.handle;
+    this.maxPerPeer = Number.isFinite(opts.maxPerPeer) && opts.maxPerPeer > 0
+      ? Math.floor(opts.maxPerPeer)
+      : Infinity;
     this.log = opts.log ?? (() => {});
     this.stopped = false;
-    /** @type {Map<string, {pending: object[], timer: NodeJS.Timeout|null, running: boolean}>} */
+    /** false 表示已停止接收（drain 期间 / 关闭中），但已有消息继续处理 */
+    this.accepting = true;
+    /** 在途的 #flush promise，drain/waitIdle 用它判断是否真的空闲 */
+    this.inflight = new Set();
+    /** 最近一次 drain 超时放弃的条数（诊断） */
+    this.abandonedCount = 0;
+    /** 因每用户上限被拒绝的累计条数（诊断） */
+    this.rejectedCount = 0;
+    /** @type {Map<string, {pending: object[], timer: NodeJS.Timeout|null, running: boolean, currentItems: object[]|null}>} */
     this.states = new Map();
   }
 
@@ -79,14 +91,28 @@ export class UserMessageQueue {
    *
    * @param {string} peerId
    * @param {object} item - { text, images?, files?, contextToken?, kind?, mergeable? }
+   * @returns {{accepted: boolean, reason?: 'stopped'|'draining'|'invalid'}}
+   *          关闭/排空期间拒绝入队（不抛错），调用方据此提示或保留 pending
    */
   push(peerId, item) {
-    if (this.stopped) return;
-    if (!peerId) return;
+    if (this.stopped) return { accepted: false, reason: 'stopped' };
+    if (!this.accepting) return { accepted: false, reason: 'draining' };
+    if (!peerId || !item) return { accepted: false, reason: 'invalid' };
     const st = this.#state(peerId);
+    // 每用户上限：拒绝最新一条（不是丢最旧），用户能立刻感知并重发
+    if (st.pending.length >= this.maxPerPeer) {
+      this.rejectedCount += 1;
+      return { accepted: false, reason: 'full' };
+    }
     // 记录到达时间：窗口按最后一条算，maxWait 按第一条算。
     st.pending.push({ ...item, receivedAt: Date.now() });
     this.#arm(peerId, st);
+    return { accepted: true };
+  }
+
+  /** 停止接收新消息，但保留 pending 与在途回合（供 drain 使用）。 */
+  stopAccepting() {
+    this.accepting = false;
   }
 
   /** 诊断用：有多少用户的队列在忙 / 还有多少条待处理。 */
@@ -97,12 +123,72 @@ export class UserMessageQueue {
       pending += st.pending.length;
       if (st.running) running++;
     }
-    return { peers: this.states.size, pending, running };
+    return {
+      peers: this.states.size,
+      pending,
+      running,
+      accepting: this.accepting,
+      abandoned: this.abandonedCount,
+      rejected: this.rejectedCount,
+      maxPerPeer: Number.isFinite(this.maxPerPeer) ? this.maxPerPeer : null,
+    };
+  }
+
+  /**
+   * 排空：不再接受新消息 → 立刻结算合并窗口 → 等所有在途回合结束。
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.timeoutMs]
+   * @returns {Promise<{idle: boolean, abandoned: string[]}>} 超时时返回未 commit 的 journalId
+   */
+  async drain({ timeoutMs = 20_000 } = {}) {
+    this.accepting = false;
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+
+    for (const [peerId, st] of this.states) {
+      // 合并窗口不再等待：关闭时立刻处理已到达的消息
+      if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+      if (!st.running && st.pending.length > 0) this.#scheduleFlush(peerId);
+    }
+
+    return this.waitIdle({ timeoutMs: Math.max(0, deadline - Date.now()) });
+  }
+
+  /**
+   * 等到没有 pending、也没有在途回合。
+   * @param {{timeoutMs?: number}} [opts]
+   * @returns {Promise<{idle: boolean, abandoned: string[]}>}
+   */
+  async waitIdle({ timeoutMs = 20_000 } = {}) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+
+    for (;;) {
+      // 兜底：有 pending 却没在跑、也没定时器（例如 drain 过程中新结算出来的批）
+      for (const [peerId, st] of this.states) {
+        if (!st.running && st.pending.length > 0 && !st.timer) this.#scheduleFlush(peerId);
+      }
+
+      const busy = this.inflight.size > 0
+        || [...this.states.values()].some((st) => st.running || st.pending.length > 0);
+      if (!busy) {
+        this.abandonedCount = 0;
+        return { idle: true, abandoned: [] };
+      }
+
+      if (Date.now() >= deadline) {
+        const abandoned = this.#abandonedIds();
+        this.abandonedCount = abandoned.length;
+        return { idle: false, abandoned };
+      }
+
+      await new Promise((r) => setTimeout(r, 10));
+    }
   }
 
   /** 停止接收并清掉所有待处理定时器（已经在跑的回合并不会被打断）。 */
   stop() {
     this.stopped = true;
+    this.accepting = false;
     for (const st of this.states.values()) {
       if (st.timer) clearTimeout(st.timer);
       st.timer = null;
@@ -115,10 +201,19 @@ export class UserMessageQueue {
   #state(peerId) {
     let st = this.states.get(peerId);
     if (!st) {
-      st = { pending: [], timer: null, running: false };
+      st = { pending: [], timer: null, running: false, currentItems: null };
       this.states.set(peerId, st);
     }
     return st;
+  }
+
+  /** 把一次 #flush 记进 inflight，drain/waitIdle 才能等它。 */
+  #scheduleFlush(peerId) {
+    const p = this.#flush(peerId)
+      .catch((err) => this.log(`处理 ${peerId} 的消息失败: ${err?.message ?? err}`))
+      .finally(() => this.inflight.delete(p));
+    this.inflight.add(p);
+    return p;
   }
 
   /** 重新计算等待时间（每次新消息都重置防抖；已在跑则等它结束再排）。 */
@@ -127,6 +222,12 @@ export class UserMessageQueue {
     if (st.timer) {
       clearTimeout(st.timer);
       st.timer = null;
+    }
+
+    // 已停止接收（drain 中）：不再等合并窗口，立刻处理
+    if (!this.accepting) {
+      this.#scheduleFlush(peerId);
+      return;
     }
 
     const now = Date.now();
@@ -138,7 +239,7 @@ export class UserMessageQueue {
 
     st.timer = setTimeout(() => {
       st.timer = null;
-      this.#flush(peerId).catch((err) => this.log(`处理 ${peerId} 的消息失败: ${err?.message ?? err}`));
+      this.#scheduleFlush(peerId);
     }, delay);
   }
 
@@ -155,6 +256,7 @@ export class UserMessageQueue {
     const items = st.pending.splice(0, count);
 
     st.running = true;
+    st.currentItems = items;
     try {
       await this.handle(peerId, mergeQueueItems(items), items);
     } catch (err) {
@@ -162,9 +264,35 @@ export class UserMessageQueue {
       this.log(`处理 ${peerId} 的消息失败: ${err?.message ?? err}`);
     } finally {
       st.running = false;
+      st.currentItems = null;
       if (st.pending.length > 0) this.#arm(peerId, st);
-      // 空闲用户不留状态，避免长时间运行后 Map 里堆满历史 peer
+      // 空闲用户不留状态，避免长时间运行后 Map 里堆满历史 peer。
+      // 注意：此刻当前 flush 仍在 this.inflight 里（外层 #scheduleFlush 才移除），
+      // 不能拿 inflight.size 当条件，否则 states 永远不会被清理。
       else if (!st.timer) this.states.delete(peerId);
     }
+  }
+
+  /**
+   * 尚未 commit 的 journalId（pending + 正在处理的批）。
+   * 供关闭流程在强制退出前记录「放弃了哪些消息」。
+   * @returns {string[]}
+   */
+  abandonedIds() {
+    return this.#abandonedIds();
+  }
+
+  /** 尚未 commit 的 journalId：pending + 正在处理的批。 */
+  #abandonedIds() {
+    const ids = [];
+    for (const st of this.states.values()) {
+      for (const item of st.pending) {
+        if (item.journalId) ids.push(item.journalId);
+      }
+      for (const item of st.currentItems ?? []) {
+        if (item.journalId) ids.push(item.journalId);
+      }
+    }
+    return ids;
   }
 }

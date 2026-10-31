@@ -228,5 +228,45 @@ await check('stats 能反映待处理与运行中的队列', async () => {
   q.stop();
 });
 
+await check('push 返回 accepted；每用户上限拒绝最新一条', async () => {
+  const batches = [];
+  const q = new UserMessageQueue({
+    windowMs: 20,
+    maxPerPeer: 2,
+    handle: (_peer, batch) => { batches.push(batch.messageCount); },
+  });
+
+  assert.deepStrictEqual(q.push('u1', { text: '1' }), { accepted: true });
+  assert.deepStrictEqual(q.push('u1', { text: '2' }), { accepted: true });
+  assert.deepStrictEqual(q.push('u1', { text: '3' }), { accepted: false, reason: 'full' });
+  assert.strictEqual(q.stats().rejected, 1);
+  assert.strictEqual(q.stats().pending, 2, '拒绝的是最新一条，前两条保留');
+  assert.strictEqual(q.stats().maxPerPeer, 2);
+  q.stop();
+});
+
+await check('stop() 之后 push 返回 stopped', () => {
+  const q = new UserMessageQueue({ handle: () => {} });
+  q.stop();
+  assert.deepStrictEqual(q.push('u1', { text: 'x' }), { accepted: false, reason: 'stopped' });
+});
+
+await check('空闲后清理 states（避免按 peer 无界增长）', async () => {
+  const q = new UserMessageQueue({ windowMs: 10, handle: async () => {} });
+  q.push('u-clean', { text: 'x' });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.strictEqual(q.stats().pending, 0);
+  assert.strictEqual(q.stats().peers, 0, '空闲 peer 的状态必须删除');
+  q.stop();
+});
+
+await check('abandonedIds 返回 pending 中未 commit 的 journalId', () => {
+  const q = new UserMessageQueue({ windowMs: 60_000, handle: () => {} });
+  q.push('u1', { text: 'x', journalId: 'm:1' });
+  q.push('u1', { text: 'y', journalId: 'm:2' });
+  assert.deepStrictEqual(q.abandonedIds().sort(), ['m:1', 'm:2']);
+  q.stop();
+});
+
 console.log(`\n${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);
