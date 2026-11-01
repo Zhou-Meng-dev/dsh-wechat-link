@@ -70,8 +70,14 @@ await check('formatStatus：状态/会话/队列/任务/用量完整可读', () 
     dlq: { items: 1 },
     tasks: { total: 5, enabled: 3 },
     usage: {
-      day: { turns: 2, failedTurns: 0, totalTokens: 1234 },
-      month: { turns: 9, failedTurns: 1, totalTokens: 5678 },
+      day: {
+        turns: 2, failedTurns: 0,
+        inputTokens: 1000, outputTokens: 234, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 1234,
+      },
+      month: {
+        turns: 9, failedTurns: 1,
+        inputTokens: 5000, outputTokens: 678, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 5678,
+      },
     },
   });
   assert.match(text, /运行状态/);
@@ -82,7 +88,7 @@ await check('formatStatus：状态/会话/队列/任务/用量完整可读', () 
   assert.match(text, /待发: 4 条（重试 2，已放弃 1）/);
   assert.match(text, /限流: 拒绝 2 条（速率 1 \/ 预算 1）/);
   assert.match(text, /定时任务: 5 个（启用 3 个）/);
-  assert.match(text, /今日 2 回合 \/ 1,234 tokens/);
+  assert.match(text, /用量（不含缓存）: 今日 2 回合 \/ 1,234 tokens/);
   assert.match(text, /本月 9 回合 \/ 5,678 tokens/);
 });
 
@@ -149,6 +155,22 @@ await check('formatUsageSummary：没有数据时也给出日期', () => {
   });
   assert.match(text, /今日 2026-10-30: 暂无记录/);
   assert.match(text, /本月 2026-10: 暂无记录/);
+});
+
+await check('formatUsageSummary：主数字是输入+输出，缓存读单列', () => {
+  const bucket = {
+    key: '2026-10-31', turns: 2, failedTurns: 0,
+    inputTokens: 1000, outputTokens: 500,
+    cacheReadTokens: 20000, cacheWriteTokens: 0, totalTokens: 21500,
+  };
+  const text = formatUsageSummary({
+    day: bucket,
+    month: { ...bucket, key: '2026-10' },
+    budget: {},
+  });
+  assert.match(text, /2 回合 \/ 1,500 tokens（输入 1,000 \+ 输出 500）/);
+  assert.match(text, /缓存读 20,000 · 写 0/);
+  assert.ok(!/21,500 tokens/.test(text), '主数字不能再用含缓存的 totalTokens');
 });
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

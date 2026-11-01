@@ -23,6 +23,8 @@
 - 优雅退出：`SIGTERM` / `SIGINT` 后停止接收、排空在途回合、刷盘并退出；
   `BRIDGE_SHUTDOWN_TIMEOUT_MS`（默认 20s）控制进程级超时，第二次信号立即退出（exit 130）。
 - `/status` 增加待发/重试/放弃与限流计数。
+- `/usage` 与 `/status` 的 token 展示区分「输入 + 输出」与「缓存读」：主数字不再包含缓存读，
+  避免把累计计量误读成上下文大小。
 - `outbox.json` 升至 v2：新增 `seq` / `clientId` / `attempts` / `nextAttemptAt` / `lastError`；
   兼容读取 v1，顶层仍是 `peers`，回滚到旧版本仍可读取。
 - `usage.json` 升至 v2：新增 `peers`（每用户日/月 token）；旧文件按空 `peers` 读入。

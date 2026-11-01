@@ -116,9 +116,11 @@ export function formatStatus(status = {}) {
   if (status.usage?.day) {
     const d = status.usage.day;
     const m = status.usage.month;
-    const today = `${d.turns ?? 0} 回合 / ${formatTokens(d.totalTokens)} tokens`;
-    const month = m ? `；本月 ${m.turns ?? 0} 回合 / ${formatTokens(m.totalTokens)} tokens` : '';
-    lines.push(`用量: 今日 ${today}${month}`);
+    // 与 /usage 一致：只报输入+输出（不含缓存），避免被误读成上下文大小
+    const fresh = (b) => (b?.inputTokens ?? 0) + (b?.outputTokens ?? 0);
+    const today = `${d.turns ?? 0} 回合 / ${formatTokens(fresh(d))} tokens`;
+    const month = m ? `；本月 ${m.turns ?? 0} 回合 / ${formatTokens(fresh(m))} tokens` : '';
+    lines.push(`用量（不含缓存）: 今日 ${today}${month}`);
   }
   return lines.join('\n');
 }

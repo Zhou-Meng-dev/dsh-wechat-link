@@ -197,12 +197,14 @@ export function formatUsageSummary(summary, opts = {}) {
       continue;
     }
     const failed = b.failedTurns > 0 ? `（失败 ${b.failedTurns}）` : '';
-    lines.push(`${label}${key}: ${b.turns} 回合${failed} / ${formatTokens(b.totalTokens)} tokens`);
+    // 主数字只用「输入 + 输出」：totalTokens 还包含缓存读，直接展示会被误读成
+    // 「上下文用了这么多」——上下文是单次请求的 prompt 大小，与累计计量不是一回事。
+    const fresh = (b.inputTokens ?? 0) + (b.outputTokens ?? 0);
     lines.push(
-      `  输入 ${formatTokens(b.inputTokens)}`
-      + `（缓存读 ${formatTokens(b.cacheReadTokens)} / 写 ${formatTokens(b.cacheWriteTokens)}）`
-      + ` · 输出 ${formatTokens(b.outputTokens)}`,
+      `${label}${key}: ${b.turns} 回合${failed} / ${formatTokens(fresh)} tokens`
+      + `（输入 ${formatTokens(b.inputTokens)} + 输出 ${formatTokens(b.outputTokens)}）`,
     );
+    lines.push(`  缓存读 ${formatTokens(b.cacheReadTokens)} · 写 ${formatTokens(b.cacheWriteTokens)}`);
   }
 
   const models = summary?.month?.models && Object.keys(summary.month.models).length
