@@ -32,10 +32,14 @@ export const DUE_GRACE_MS = 1_000;
 export const MAX_WINDOW_COUNT = 100;
 
 /**
- * 窗口任务错过多久就不再补发。
- * 例如 08:37 的点，服务 08:45 才恢复：超过 5 分钟直接跳过，等下一个点。
+ * 错过多久就不再补发：超过这个宽限，周期任务直接推进到下一个周期。
+ * 例如 08:37 的点，服务 08:45 才恢复：超过 5 分钟跳过，等下一个点。
+ * 宽限内仍然补跑（吸收 tick 抖动与几秒级的重启）。
  */
-export const WINDOW_MISSED_GRACE_MS = 5 * 60_000;
+export const MISSED_GRACE_MS = 5 * 60_000;
+
+/** @deprecated 用 MISSED_GRACE_MS；窗口任务曾单独用这个值。 */
+export const WINDOW_MISSED_GRACE_MS = MISSED_GRACE_MS;
 
 const CLOCK_RE = /^(\d{1,2}):(\d{2})$/;
 
@@ -639,16 +643,36 @@ export class TaskStore {
    * @param {number} [now]
    * @returns {boolean}
    */
+  /**
+   * 把错过时间点的任务推进到下一个未来时间点。
+   * `once` 没有「下一个周期」，返回 null（补跑一次仍比丢掉提醒好）。
+   *
+   * @returns {number|null} 新的 nextRunAt
+   */
   skipMissed(id, now = Date.now()) {
     const t = this.get(id);
-    if (!t || t.schedule?.kind !== 'window') return null;
+    if (!t || t.schedule?.kind === 'once') return null;
     const next = computeNextRun(t.schedule, now, { seed: t.id });
-    if (!next) return null;
+    if (!next || next <= now) return null;
     t.nextRunAt = next;
     this.ops.push({ kind: 'schedule', id, schedule: t.schedule, nextRunAt: next });
     this.dirty = true;
     // 返回新的时间戳（调用方直接用于「下次 …」展示；返回 boolean 会被当成 0 显示成 1970）
     return next;
+  }
+
+  /**
+   * 任务是否已经「错过太久」：超过宽限就不该补跑，直接等下一个周期。
+   * `once` 永远返回 false —— 没有下一个周期，补跑一次比丢掉提醒好。
+   *
+   * @param {object} task
+   * @param {number} [now]
+   * @param {number} [graceMs]
+   */
+  isMissed(task, now = Date.now(), graceMs = MISSED_GRACE_MS) {
+    if (!task || task.schedule?.kind === 'once') return false;
+    if (!task.enabled || typeof task.nextRunAt !== 'number') return false;
+    return now - task.nextRunAt > graceMs;
   }
 
   /**

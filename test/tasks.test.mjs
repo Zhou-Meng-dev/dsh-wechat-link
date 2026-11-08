@@ -452,6 +452,31 @@ await check('暂停几天后恢复：过期的 nextRunAt 重算到未来（不�
   assert.deepStrictEqual(s.due(now), [], '恢复瞬间不应被判为到点');
 });
 
+await check('错过太久：周期任务跳过并推进，once 仍补跑', async () => {
+  const p = join(dir, 'missed.json');
+  const s = new TaskStore(p);
+  await s.load();
+
+  const daily = s.add({ schedule: { kind: 'daily', time: '23:00' }, prompt: 'x', title: '每日' });
+  const once = s.add({ schedule: { kind: 'once', at: '2020-01-01 00:00' }, prompt: 'y' });
+  const past = Date.now() - 2 * 60 * 60 * 1000;
+  s.get(daily.id).nextRunAt = past;
+  s.get(once.id).nextRunAt = past;
+
+  const now = Date.now();
+  assert.strictEqual(s.isMissed(s.get(daily.id), now), true, '超过宽限应判为错过');
+  const next = s.skipMissed(daily.id, now);
+  assert.ok(next > now, '应推进到下一个周期');
+  assert.strictEqual(s.get(daily.id).nextRunAt, next);
+
+  assert.strictEqual(s.isMissed(s.get(once.id), now), false, 'once 没有下一个周期，仍补跑');
+  assert.strictEqual(s.skipMissed(once.id, now), null);
+
+  const fresh = s.add({ schedule: { kind: 'daily', time: '23:00' }, prompt: 'z' });
+  s.get(fresh.id).nextRunAt = now - 30_000;
+  assert.strictEqual(s.isMissed(s.get(fresh.id), now), false, '宽限内不算错过');
+});
+
 await check('setSchedule 改时间并重新启用', async () => {
   const p = join(dir, 'update.json');
   const s = new TaskStore(p);

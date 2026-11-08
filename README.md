@@ -186,6 +186,7 @@ node src/main.mjs task <id> rm|enable|disable|update|snooze ...
 - `/new` 只清对话上下文和链接缓存，**不会**删除 `tasks.json`、任务历史或 `_quiz/` 里的计分；下一次触发会从状态文件恢复。
 - 任务历史写入 `task-history.json` 和 `_tasks/history.json`；失败会给 owner 发可操作提示。
 - 一次性任务执行完（成功/失败/跳过）会从 `tasks.json` 移除，只在任务历史里留记录；`/tasks` 与 `_tasks/current.json` 只列还没执行的任务。
+- 周期任务错过超过 5 分钟就不补跑（服务停机/休眠跨过时间点后直接等下一个周期）；一次性任务仍会补跑一次。
 
 - 主动推送依赖 `context_token`；token 失效时消息进 `outbox.json`，用户下次发消息后补发，不丢。
 

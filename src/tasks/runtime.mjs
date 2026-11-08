@@ -20,7 +20,7 @@ import { existsSync, watch } from 'node:fs';
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { TaskStore, formatNextRun, nextDueDelay, WINDOW_MISSED_GRACE_MS } from './tasks.mjs';
+import { TaskStore, formatNextRun, nextDueDelay } from './tasks.mjs';
 import { budgetBlocked } from '../ops/budget-guard.mjs';
 import { raceWithTimeout } from '../ops/deadline.mjs';
 import {
@@ -245,15 +245,12 @@ export class TaskRuntime {
 
       const now = Date.now();
       for (const task of this.tasks.due(now)) {
-        // 窗口任务错过的点不补发：直接推进到下一个未来时间点
-        if (
-          task.schedule?.kind === 'window'
-          && typeof task.nextRunAt === 'number'
-          && now - task.nextRunAt > WINDOW_MISSED_GRACE_MS
-        ) {
+        // 错过太久（停机/休眠跨过时间点）就不再补发：推进到下一个周期。
+        // once 任务没有下一个周期，仍然补跑一次。
+        if (this.tasks.isMissed(task, now)) {
           const next = this.tasks.skipMissed(task.id, now);
           this.log(
-            `[task] ⏭ 跳过已错过的窗口时间「${task.title}」`
+            `[task] ⏭ 跳过已错过的执行时间「${task.title}」`
             + `${next ? `，下次 ${formatNextRun(next)}` : ''}`,
           );
           if (next) await this.#flushTasks().catch(() => {});
