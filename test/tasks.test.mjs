@@ -424,6 +424,34 @@ await check('resolve 标题有歧义时抛错并列出候选', async () => {
   assert.throws(() => s.resolve('每日'), /每日一题/);
 });
 
+await check('暂停几天后恢复：过期的 nextRunAt 重算到未来（不补跑）', async () => {
+  const p = join(dir, 'resume.json');
+  const s = new TaskStore(p);
+  await s.load();
+
+  const daily = s.add({ schedule: { kind: 'daily', time: '23:00' }, prompt: 'x', title: '每日' });
+  const win = s.add({
+    schedule: { kind: 'window', start: '09:00', end: '23:00', count: 5 },
+    prompt: 'y',
+    title: '窗口',
+  });
+
+  // 模拟「暂停了几天」：nextRunAt 停在过去
+  const past = Date.now() - 3 * 24 * 3600 * 1000;
+  for (const id of [daily.id, win.id]) {
+    s.get(id).nextRunAt = past;
+    s.setEnabled(id, false);
+  }
+
+  const now = Date.now();
+  s.setEnabled(daily.id, true);
+  s.setEnabled(win.id, true);
+
+  assert.ok(s.get(daily.id).nextRunAt > now, 'daily 恢复后应指向未来');
+  assert.ok(s.get(win.id).nextRunAt > now, 'window 恢复后应指向未来');
+  assert.deepStrictEqual(s.due(now), [], '恢复瞬间不应被判为到点');
+});
+
 await check('setSchedule 改时间并重新启用', async () => {
   const p = join(dir, 'update.json');
   const s = new TaskStore(p);

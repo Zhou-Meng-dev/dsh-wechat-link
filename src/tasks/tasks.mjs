@@ -563,8 +563,16 @@ export class TaskStore {
     const t = this.get(id);
     if (!t) return false;
     t.enabled = Boolean(enabled);
-    if (t.enabled && !t.nextRunAt) {
-      t.nextRunAt = computeNextRun(t.schedule, Date.now(), { seed: t.id });
+    if (t.enabled) {
+      const now = Date.now();
+      // 暂停几天后 nextRunAt 已经是过去时间，必须重算而不是沿用旧值：
+      //   - daily/weekly/every 会因此立刻补跑一次；
+      //   - window 会走进「跳过已错过」分支，恢复回执里的「下次」还是过去时间
+      //     （用户看到的就是「没恢复成功」）。
+      if (!Number.isFinite(t.nextRunAt) || t.nextRunAt <= now) {
+        t.nextRunAt = computeNextRun(t.schedule, now, { seed: t.id });
+        this.ops.push({ kind: 'schedule', id, schedule: t.schedule, nextRunAt: t.nextRunAt });
+      }
     }
     this.ops.push({ kind: 'enabled', id, enabled: Boolean(enabled) });
     this.dirty = true;
@@ -633,13 +641,14 @@ export class TaskStore {
    */
   skipMissed(id, now = Date.now()) {
     const t = this.get(id);
-    if (!t || t.schedule?.kind !== 'window') return false;
+    if (!t || t.schedule?.kind !== 'window') return null;
     const next = computeNextRun(t.schedule, now, { seed: t.id });
-    if (!next) return false;
+    if (!next) return null;
     t.nextRunAt = next;
     this.ops.push({ kind: 'schedule', id, schedule: t.schedule, nextRunAt: next });
     this.dirty = true;
-    return true;
+    // 返回新的时间戳（调用方直接用于「下次 …」展示；返回 boolean 会被当成 0 显示成 1970）
+    return next;
   }
 
   /**

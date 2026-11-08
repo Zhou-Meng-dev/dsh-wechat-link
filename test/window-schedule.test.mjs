@@ -111,8 +111,9 @@ test('TaskStore：错过窗口点后 skipMissed 推进到未来', async () => {
   assert.ok(task.nextRunAt > 0);
 
   const now = task.nextRunAt + WINDOW_MISSED_GRACE_MS + 60_000;
-  assert.equal(store.skipMissed(task.id, now), true);
-  assert.ok(store.get(task.id).nextRunAt > now);
+  const skippedTo = store.skipMissed(task.id, now);
+  assert.ok(skippedTo > now, 'skipMissed 应返回新的时间戳，而不是 true');
+  assert.equal(store.get(task.id).nextRunAt, skippedTo);
 
   await rm(dir, { recursive: true, force: true });
 });
